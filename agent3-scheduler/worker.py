@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,8 @@ from tools import (
     recommend_restaurant,
 )
 
+logger = logging.getLogger(__name__)
+
 SYSTEM_PROMPT = """\
 You are the Daily Scheduler Agent.
 Goal: create a realistic, chronological one-day schedule.
@@ -29,16 +32,21 @@ Input (JSON):
 - preferences: list[str]
 
 Scheduling policy:
-1) Order places using order_places_by_proximity.
+1) Call order_places_by_proximity to get an efficient visit order.
 2) Use estimate_travel_minutes between consecutive visits.
 3) Keep events chronological, non-overlapping, and within [day_start, day_end].
 4) Insert lunch in [12:00, 14:00] and dinner in [19:00, 21:00] when time allows.
-5) For each meal slot, call recommend_restaurant and select first result if available.
+5) For each meal slot, call recommend_restaurant and select the first result if available.
+   If recommend_restaurant returns an error or empty list, skip that meal event.
 6) Budget per meal = food_budget_per_day / 2 when budget exists.
-7) If no places can fit, return empty events list for that date.
+7) If no places can fit, return an empty events list.
+
+Important:
+- If a tool call returns {"error": ...}, ignore it gracefully and continue scheduling.
+- Do NOT retry a tool that already returned an error. Move on.
 
 Output rules (STRICT):
-- Return ONLY JSON (no markdown or prose).
+- Return ONLY JSON (no markdown, no prose, no backticks).
 - Return exactly:
 {
     "date": "YYYY-MM-DD",
@@ -92,12 +100,14 @@ class SchedulerWorker(Worker[None]):
             data = extract_message_data(params["message"])
             llm = get_llm_client()
 
+            day_date = _extract_date(data.get("day_start", ""))
+
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(data)},
             ]
 
-            for _ in range(20):
+            for step in range(20):
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
@@ -126,26 +136,44 @@ class SchedulerWorker(Worker[None]):
                         }
                     )
                     for tc in tool_calls:
-                        args = json.loads(tc.function.arguments)
                         name = tc.function.name
-                        if name == "order_places_by_proximity":
-                            tool_result = order_places_by_proximity(**args)
-                        elif name == "estimate_travel_minutes":
-                            tool_result = estimate_travel_minutes(**args)
-                        elif name == "recommend_restaurant":
-                            tool_result = await recommend_restaurant(**args)
-                        else:
-                            tool_result = {"error": f"Unknown tool: {name}"}
-                        messages.append(
-                            {
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            tool_result: Any = {"error": f"Bad arguments for {name}: {exc}"}
+                            messages.append({
                                 "role": "tool",
                                 "content": json.dumps(tool_result),
                                 "tool_call_id": tc.id,
-                            }
-                        )
+                            })
+                            continue
+
+                        try:
+                            if name == "order_places_by_proximity":
+                                tool_result = order_places_by_proximity(**args)
+                            elif name == "estimate_travel_minutes":
+                                tool_result = estimate_travel_minutes(**args)
+                            elif name == "recommend_restaurant":
+                                tool_result = await recommend_restaurant(**args)
+                            else:
+                                tool_result = {"error": f"Unknown tool: {name}"}
+                        except Exception as exc:
+                            logger.warning(
+                                "Scheduler tool %s failed task_id=%s: %s", name, task_id, exc
+                            )
+                            # Return an error message so the LLM can gracefully skip this meal
+                            tool_result = {"error": f"{name} failed: {exc}", "restaurants": []}
+
+                        messages.append({
+                            "role": "tool",
+                            "content": json.dumps(tool_result),
+                            "tool_call_id": tc.id,
+                        })
                 else:
                     raw = choice.message.content or "{}"
                     result = _parse_json(raw)
+                    if not result.get("date") and day_date:
+                        result["date"] = day_date
                     await self.storage.update_task(
                         task_id,
                         state="completed",
@@ -153,9 +181,16 @@ class SchedulerWorker(Worker[None]):
                     )
                     return
 
-            await self.storage.update_task(task_id, state="failed")
+            # Exhausted iterations — complete with empty schedule rather than fail
+            logger.warning("Scheduler exhausted iterations task_id=%s, returning empty day", task_id)
+            await self.storage.update_task(
+                task_id,
+                state="completed",
+                new_artifacts=self.build_artifacts({"date": day_date, "events": []}),
+            )
 
         except Exception:
+            logger.exception("Scheduler task crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
 
@@ -168,4 +203,18 @@ def _parse_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"date": "", "events": []}
+        pass
+    brace = text.find("{")
+    if brace > 0:
+        try:
+            return json.loads(text[brace:])
+        except json.JSONDecodeError:
+            pass
+    return {"date": "", "events": []}
+
+
+def _extract_date(iso: str) -> str:
+    """Extract YYYY-MM-DD from an ISO datetime string."""
+    if iso and len(iso) >= 10:
+        return iso[:10]
+    return ""

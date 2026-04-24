@@ -38,6 +38,12 @@ class TripRequest(BaseModel):
     preferences: list[str] = []
 
 
+class ChatRequest(BaseModel):
+    message: str
+    current_itinerary: dict | None = None
+    original_params: dict | None = None
+
+
 class AgentStatusResponse(BaseModel):
     name: str
     url: str
@@ -53,15 +59,12 @@ async def serve_index():
 
 @app.post("/api/plan")
 async def plan_trip(req: TripRequest) -> JSONResponse:
-    """Forward a trip planning request to the Orchestrator agent and stream back the itinerary."""
+    """Forward an initial trip planning request to the Orchestrator."""
     start_time = time.perf_counter()
     logger.info(
         "Plan request received city=%s trip_start=%s trip_end=%s has_budget=%s preference_count=%d",
-        req.city,
-        req.trip_start,
-        req.trip_end,
-        req.total_budget is not None,
-        len(req.preferences),
+        req.city, req.trip_start, req.trip_end,
+        req.total_budget is not None, len(req.preferences),
     )
 
     budget_payload = (
@@ -70,50 +73,57 @@ async def plan_trip(req: TripRequest) -> JSONResponse:
         else None
     )
     payload: dict[str, Any] = {
-        "city": req.city,
-        "trip_start": req.trip_start,
-        "trip_end": req.trip_end,
-        "budget": budget_payload,
+        "city":        req.city,
+        "trip_start":  req.trip_start,
+        "trip_end":    req.trip_end,
+        "budget":      budget_payload,
         "trip_reason": req.trip_reason,
         "preferences": req.preferences,
     }
 
     try:
-        result = await call_agent(
-            ORCHESTRATOR_URL,
-            payload,
-            timeout=600.0,
-            poll_interval=3.0,
-        )
+        result = await call_agent(ORCHESTRATOR_URL, payload, timeout=600.0, poll_interval=3.0)
         elapsed = time.perf_counter() - start_time
-        schedules = (
-            len(result.get("schedules", []))
-            if isinstance(result, dict)
-            else "unknown"
-        )
+        schedules = len(result.get("schedules", [])) if isinstance(result, dict) else "unknown"
         logger.info(
             "Plan request succeeded city=%s elapsed_sec=%.2f schedules=%s",
-            req.city,
-            elapsed,
-            schedules,
+            req.city, elapsed, schedules,
         )
         return JSONResponse(content=result)
     except TimeoutError as exc:
-        logger.warning(
-            "Plan request timed out city=%s trip_start=%s trip_end=%s error=%s",
-            req.city,
-            req.trip_start,
-            req.trip_end,
-            exc,
-        )
         raise HTTPException(status_code=504, detail=str(exc))
     except Exception as exc:
-        logger.exception(
-            "Plan request failed city=%s trip_start=%s trip_end=%s",
-            req.city,
-            req.trip_start,
-            req.trip_end,
+        logger.exception("Plan request failed city=%s", req.city)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> JSONResponse:
+    """Handle a follow-up modification request against an existing itinerary."""
+    if not req.current_itinerary or not req.original_params:
+        raise HTTPException(
+            status_code=400,
+            detail="current_itinerary and original_params are required for chat modifications.",
         )
+
+    start_time = time.perf_counter()
+    logger.info("Chat modification request: %s", req.message[:120])
+
+    payload: dict[str, Any] = {
+        **req.original_params,
+        "modification_request": req.message,
+        "current_itinerary":    req.current_itinerary,
+    }
+
+    try:
+        result = await call_agent(ORCHESTRATOR_URL, payload, timeout=600.0, poll_interval=3.0)
+        elapsed = time.perf_counter() - start_time
+        logger.info("Chat modification succeeded elapsed_sec=%.2f", elapsed)
+        return JSONResponse(content={"itinerary": result})
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Chat modification failed")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -121,11 +131,11 @@ async def plan_trip(req: TripRequest) -> JSONResponse:
 async def agents_status() -> list[AgentStatusResponse]:
     """Check the health of all agent services."""
     agents = [
-        ("Orchestrator", ORCHESTRATOR_URL),
+        ("Orchestrator",     ORCHESTRATOR_URL),
         ("Place Recommender", os.getenv("AGENT1_URL", "http://localhost:8001")),
-        ("Clustering", os.getenv("AGENT2_URL", "http://localhost:8002")),
-        ("Daily Scheduler", os.getenv("AGENT3_URL", "http://localhost:8003")),
-        ("Food Recommender", os.getenv("AGENT4_URL", "http://localhost:8004")),
+        ("Clustering",        os.getenv("AGENT2_URL", "http://localhost:8002")),
+        ("Daily Scheduler",   os.getenv("AGENT3_URL", "http://localhost:8003")),
+        ("Food Recommender",  os.getenv("AGENT4_URL", "http://localhost:8004")),
     ]
     statuses: list[AgentStatusResponse] = []
     async with httpx.AsyncClient(timeout=5.0) as client:

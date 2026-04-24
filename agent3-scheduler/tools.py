@@ -60,9 +60,9 @@ def order_places_by_proximity(
 async def recommend_restaurant(
     time_of_day: str,
     search_center: dict[str, float],
-    search_radius_meters: int,
-    budget_per_meal_per_person: float | None,
-    preferences: list[str] | None,
+    search_radius_meters: int = 500,
+    budget_per_meal_per_person: float | None = None,
+    preferences: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Call Agent 4 (Food Recommender) via A2A and return restaurant candidates."""
     payload: dict[str, Any] = {
@@ -160,7 +160,7 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "Dietary or cuisine preferences.",
                     },
                 },
-                "required": ["time_of_day", "search_center", "search_radius_meters"],
+                "required": ["time_of_day", "search_center"],
             },
         },
     },
