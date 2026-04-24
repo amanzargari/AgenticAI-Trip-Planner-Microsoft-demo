@@ -13,29 +13,51 @@ from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, geocode_city, search_places
 
 SYSTEM_PROMPT = """\
-You are a visiting-place recommendation agent for travellers.
+You are the Place Recommender Agent.
+Goal: produce a high-quality, diverse list of places to visit for a trip.
 
-You receive a JSON object with:
-  - city           : destination city (string)
-  - trip_start     : ISO datetime
-  - trip_end       : ISO datetime
-  - budget         : float | null  (activity budget in EUR)
-  - trip_reason    : string | null (e.g. "family vacation", "business trip")
-  - preferences    : list[str]    (e.g. ["art", "outdoor", "history"])
+Input (JSON):
+- city: destination city
+- trip_start: ISO datetime
+- trip_end: ISO datetime
+- budget: float | null (activity budget in EUR)
+- trip_reason: string | null
+- preferences: list[str]
 
-Strategy:
-1. Geocode the city to get coordinates.
-2. Run several search_places calls with different queries tailored to the preferences.
-   Aim for 3-5 diverse searches to maximise candidate variety.
-3. Deduplicate results by place id.
-4. Return the best 10-20 candidates.
+Tool strategy:
+1) Call geocode_city(city) once to anchor location context.
+2) Call search_places multiple times with varied intent:
+     - preference-focused queries (art, museums, outdoors, nightlife, etc.)
+     - broad fallback query like "top attractions in <city>"
+     - optional place_type when helpful, but do not rely on one type only
+3) Target 3-6 searches total when possible.
+4) If any tool call fails, continue with other searches.
+5) Deduplicate and keep the strongest candidates (quality + diversity).
 
-Return ONLY a JSON object (no markdown) with a single key:
-  "place_candidates": [ <list of place objects> ]
+Ranking guidance:
+- Prefer places matching preferences and trip_reason.
+- Prefer higher-rated places when ratings exist.
+- Keep a mix of categories to avoid repetitive itineraries.
 
-Each place object must include:
-  id, name, location {latitude, longitude, address},
-  estimated_visit_duration_minutes, estimated_cost, category, rating, summary.
+Output rules (STRICT):
+- Return ONLY JSON. No markdown, no prose, no questions.
+- Return this exact top-level shape:
+{
+    "place_candidates": [
+        {
+            "id": "...",
+            "name": "...",
+            "location": {"latitude": 0.0, "longitude": 0.0, "address": "..."},
+            "estimated_visit_duration_minutes": 60,
+            "estimated_cost": null,
+            "category": "...",
+            "rating": 4.5,
+            "summary": "..."
+        }
+    ]
+}
+- Return 10-20 items when available; otherwise return as many as found.
+- If no usable results are found, return {"place_candidates": []}.
 """
 
 
@@ -142,12 +164,17 @@ class PlaceRecommenderWorker(Worker[None]):
                         _parse_json(raw),
                         fallback_candidates=collected_candidates,
                     )
+                    if not result.get("place_candidates"):
+                        result["place_candidates"] = await _fallback_search_candidates(data)
                     await self.storage.update_task(
                         task_id,
                         state="completed",
                         new_artifacts=self.build_artifacts(result),
                     )
                     return
+
+            if not collected_candidates:
+                collected_candidates = await _fallback_search_candidates(data)
 
             await self.storage.update_task(
                 task_id,
@@ -222,3 +249,40 @@ def _dedupe_places(
             break
 
     return deduped
+
+
+async def _fallback_search_candidates(data: dict[str, Any]) -> list[dict[str, Any]]:
+    city = str(data.get("city") or "").strip()
+    if not city:
+        return []
+
+    preferences = data.get("preferences") if isinstance(data.get("preferences"), list) else []
+    query_candidates = [
+        f"top attractions in {city}",
+        f"things to do in {city}",
+        f"popular museums in {city}",
+    ]
+    query_candidates.extend(
+        f"{str(pref).strip()} in {city}"
+        for pref in preferences
+        if str(pref).strip()
+    )
+
+    seen_queries: set[str] = set()
+    queries: list[str] = []
+    for q in query_candidates:
+        norm = q.strip().lower()
+        if norm and norm not in seen_queries:
+            seen_queries.add(norm)
+            queries.append(q)
+
+    gathered: list[dict[str, Any]] = []
+    for query in queries[:6]:
+        try:
+            rows = await search_places(query=query, city=city)
+        except Exception:
+            continue
+        if isinstance(rows, list):
+            gathered.extend(p for p in rows if isinstance(p, dict))
+
+    return _dedupe_places(gathered)

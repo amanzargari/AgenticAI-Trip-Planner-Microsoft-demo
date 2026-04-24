@@ -35,15 +35,26 @@ async def search_places(
     """Text-search for places of interest in *city* using the Google Places API."""
     key = os.environ["GOOGLE_MAPS_API_KEY"]
 
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        normalized_query = f"top attractions in {city}"
+    elif city and city.lower() not in normalized_query.lower():
+        normalized_query = f"{normalized_query} in {city}"
+
     # Get city centre for location bias
-    geocode_results = await asyncio.to_thread(_gmaps().geocode, city)
     location: tuple[float, float] | None = None
-    if geocode_results:
-        loc = geocode_results[0]["geometry"]["location"]
-        location = (loc["lat"], loc["lng"])
+    try:
+        geocode_results = await asyncio.to_thread(_gmaps().geocode, city)
+        if geocode_results:
+            loc = geocode_results[0]["geometry"]["location"]
+            location = (loc["lat"], loc["lng"])
+    except Exception:
+        # Some keys/projects have Places enabled but Geocoding disabled.
+        # In that case, continue with unbiased text search instead of failing.
+        location = None
 
     params: dict[str, Any] = {
-        "query": query,
+        "query": normalized_query,
         "language": "en",
         "key": key,
     }

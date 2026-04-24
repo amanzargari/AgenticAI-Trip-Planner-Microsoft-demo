@@ -88,6 +88,28 @@ async def test_search_places_non_ok_status_raises():
         with pytest.raises(RuntimeError, match="Google Places text search failed"):
             await _tools.search_places(query="museums in Paris", city="Paris")
 
+
+@pytest.mark.asyncio
+async def test_search_places_geocode_failure_falls_back_to_text_search():
+    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC, patch(f"{_MOD_NAME}.httpx.AsyncClient") as AC:
+        MC.return_value.geocode.side_effect = RuntimeError("geocode denied")
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = MOCK_PLACES
+
+        http_client = AsyncMock()
+        http_client.get = AsyncMock(return_value=response)
+        AC.return_value.__aenter__.return_value = http_client
+
+        results = await _tools.search_places(query="museums", city="Paris")
+
+        assert len(results) == 2
+        sent_params = http_client.get.call_args.kwargs["params"]
+        assert "Paris" in sent_params["query"]
+        assert "location" not in sent_params
+        assert "radius" not in sent_params
+
 def test_primary_category_priority():
     assert _tools._primary_category(["museum","tourist_attraction"]) == "museum"
     assert _tools._primary_category([]) == "attraction"

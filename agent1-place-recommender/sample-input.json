@@ -1,0 +1,8 @@
+{
+  "city": "Milan, Italy",
+  "trip_start": "2026-06-10T09:00:00",
+  "trip_end": "2026-06-15T21:00:00",
+  "budget": 560,
+  "trip_reason": "friends",
+  "preferences": ["art", "outdoor", "food", "museums", "nightlife"]
+}

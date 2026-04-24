@@ -5,6 +5,9 @@ import importlib.util
 import os
 import pathlib
 import sys
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 _AGENT_DIR = pathlib.Path(__file__).parent.parent
@@ -72,3 +75,35 @@ def test_coerce_place_result_keeps_valid_candidates() -> None:
 
     assert len(result["place_candidates"]) == 1
     assert result["place_candidates"][0]["id"] == "a"
+
+
+@pytest.mark.asyncio
+async def test_fallback_search_candidates_returns_data_when_search_works() -> None:
+    sample = [_place("p1", name="Duomo")]
+    with patch.object(_worker, "search_places", new=AsyncMock(return_value=sample)):
+        rows = await _worker._fallback_search_candidates(
+            {
+                "city": "Milan, Italy",
+                "preferences": ["art", "museums"],
+            }
+        )
+
+    assert len(rows) >= 1
+    assert rows[0]["id"] == "p1"
+
+
+@pytest.mark.asyncio
+async def test_fallback_search_candidates_handles_search_errors() -> None:
+    with patch.object(
+        _worker,
+        "search_places",
+        new=AsyncMock(side_effect=RuntimeError("api down")),
+    ):
+        rows = await _worker._fallback_search_candidates(
+            {
+                "city": "Milan, Italy",
+                "preferences": ["art", "museums"],
+            }
+        )
+
+    assert rows == []
