@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fasta2a.applications import FastA2A
+from fasta2a.broker import InMemoryBroker
+from fasta2a.schema import Skill
+from fasta2a.storage import InMemoryStorage
+
+from worker import ClusteringWorker
+
+PORT = int(os.getenv("PORT", "8002"))
+SERVICE_URL = os.getenv("AGENT2_URL", f"http://localhost:{PORT}")
+
+_broker = InMemoryBroker()
+_storage: InMemoryStorage[None] = InMemoryStorage()
+_worker = ClusteringWorker(broker=_broker, storage=_storage)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastA2A):
+    async with app.task_manager:
+        async with _worker.run():
+            yield
+
+
+app = FastA2A(
+    storage=_storage,
+    broker=_broker,
+    name="Place Clustering Agent",
+    url=SERVICE_URL,
+    description=(
+        "Groups candidate places into geographically coherent clusters, "
+        "one cluster per trip day, using K-means on latitude/longitude."
+    ),
+    skills=[
+        Skill(
+            id="place-clustering",
+            name="Place Clustering",
+            description="Partition candidate places into one geographic cluster per trip day.",
+            tags=["clustering", "geography", "planning"],
+            input_modes=["application/json"],
+            output_modes=["application/json"],
+        )
+    ],
+    lifespan=_lifespan,
+)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

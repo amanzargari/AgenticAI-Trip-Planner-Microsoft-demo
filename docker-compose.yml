@@ -1,0 +1,90 @@
+version: "3.9"
+
+# Build context is always the repo root so every Dockerfile can reach shared/
+x-common-build: &common-build
+  context: .
+
+services:
+  agent4:
+    build:
+      <<: *common-build
+      dockerfile: agent4-food-recommender/Dockerfile
+    container_name: agent4
+    ports:
+      - "8004:8004"
+    env_file: .env
+    environment:
+      AGENT4_URL: http://agent4:8004
+    restart: unless-stopped
+
+  agent1:
+    build:
+      <<: *common-build
+      dockerfile: agent1-place-recommender/Dockerfile
+    container_name: agent1
+    ports:
+      - "8001:8001"
+    env_file: .env
+    environment:
+      AGENT1_URL: http://agent1:8001
+    restart: unless-stopped
+
+  agent2:
+    build:
+      <<: *common-build
+      dockerfile: agent2-clustering/Dockerfile
+    container_name: agent2
+    ports:
+      - "8002:8002"
+    env_file: .env
+    environment:
+      AGENT2_URL: http://agent2:8002
+    restart: unless-stopped
+
+  agent3:
+    build:
+      <<: *common-build
+      dockerfile: agent3-scheduler/Dockerfile
+    container_name: agent3
+    ports:
+      - "8003:8003"
+    env_file: .env
+    environment:
+      AGENT3_URL: http://agent3:8003
+      AGENT4_URL: http://agent4:8004
+    depends_on:
+      - agent4
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      <<: *common-build
+      dockerfile: agent0-orchestrator/Dockerfile
+    container_name: orchestrator
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8000
+      AGENT1_URL: http://agent1:8001
+      AGENT2_URL: http://agent2:8002
+      AGENT3_URL: http://agent3:8003
+    depends_on:
+      - agent1
+      - agent2
+      - agent3
+    restart: unless-stopped
+
+  web-ui:
+    build:
+      <<: *common-build
+      dockerfile: web-ui/Dockerfile
+    container_name: web-ui
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8000
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
