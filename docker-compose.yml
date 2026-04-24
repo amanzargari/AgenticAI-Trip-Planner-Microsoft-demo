@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Build context is always the repo root so every Dockerfile can reach shared/
 x-common-build: &common-build
   context: .
