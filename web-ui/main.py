@@ -1,7 +1,9 @@
 """Web UI backend – thin FastAPI layer that forwards requests to the Orchestrator."""
 from __future__ import annotations
 
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ from shared.a2a_utils import call_agent
 
 ORCHESTRATOR_URL: str = os.getenv("ORCHESTRATOR_URL", "http://localhost:8000")
 STATIC_DIR = Path(__file__).parent / "static"
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Trip Planner UI", docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -51,6 +54,16 @@ async def serve_index():
 @app.post("/api/plan")
 async def plan_trip(req: TripRequest) -> JSONResponse:
     """Forward a trip planning request to the Orchestrator agent and stream back the itinerary."""
+    start_time = time.perf_counter()
+    logger.info(
+        "Plan request received city=%s trip_start=%s trip_end=%s has_budget=%s preference_count=%d",
+        req.city,
+        req.trip_start,
+        req.trip_end,
+        req.total_budget is not None,
+        len(req.preferences),
+    )
+
     budget_payload = (
         {"total_budget": req.total_budget, "currency": "EUR"}
         if req.total_budget
@@ -72,10 +85,35 @@ async def plan_trip(req: TripRequest) -> JSONResponse:
             timeout=600.0,
             poll_interval=3.0,
         )
+        elapsed = time.perf_counter() - start_time
+        schedules = (
+            len(result.get("schedules", []))
+            if isinstance(result, dict)
+            else "unknown"
+        )
+        logger.info(
+            "Plan request succeeded city=%s elapsed_sec=%.2f schedules=%s",
+            req.city,
+            elapsed,
+            schedules,
+        )
         return JSONResponse(content=result)
     except TimeoutError as exc:
+        logger.warning(
+            "Plan request timed out city=%s trip_start=%s trip_end=%s error=%s",
+            req.city,
+            req.trip_start,
+            req.trip_end,
+            exc,
+        )
         raise HTTPException(status_code=504, detail=str(exc))
     except Exception as exc:
+        logger.exception(
+            "Plan request failed city=%s trip_start=%s trip_end=%s",
+            req.city,
+            req.trip_start,
+            req.trip_end,
+        )
         raise HTTPException(status_code=500, detail=str(exc))
 
 

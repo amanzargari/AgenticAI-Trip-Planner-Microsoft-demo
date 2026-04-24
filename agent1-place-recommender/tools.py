@@ -6,6 +6,10 @@ import os
 from typing import Any
 
 import googlemaps
+import httpx
+
+
+_PLACES_BASE = "https://maps.googleapis.com/maps/api/place"
 
 
 def _gmaps() -> googlemaps.Client:
@@ -29,23 +33,36 @@ async def search_places(
     place_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """Text-search for places of interest in *city* using the Google Places API."""
-    client = _gmaps()
+    key = os.environ["GOOGLE_MAPS_API_KEY"]
 
     # Get city centre for location bias
-    geocode_results = await asyncio.to_thread(client.geocode, city)
+    geocode_results = await asyncio.to_thread(_gmaps().geocode, city)
     location: tuple[float, float] | None = None
     if geocode_results:
         loc = geocode_results[0]["geometry"]["location"]
         location = (loc["lat"], loc["lng"])
 
-    kwargs: dict[str, Any] = {"query": query, "language": "en"}
+    params: dict[str, Any] = {
+        "query": query,
+        "language": "en",
+        "key": key,
+    }
     if location:
-        kwargs["location"] = location
-        kwargs["radius"] = radius_meters
+        params["location"] = f"{location[0]},{location[1]}"
+        params["radius"] = radius_meters
     if place_type:
-        kwargs["type"] = place_type
+        params["type"] = place_type
 
-    raw = await asyncio.to_thread(client.places, **kwargs)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(f"{_PLACES_BASE}/textsearch/json", params=params)
+        resp.raise_for_status()
+        raw = resp.json()
+
+    status = str(raw.get("status") or "")
+    if status not in {"OK", "ZERO_RESULTS"}:
+        details = raw.get("error_message") or status or "unknown error"
+        raise RuntimeError(f"Google Places text search failed: {details}")
+
     results: list[dict[str, Any]] = []
 
     for place in raw.get("results", []):

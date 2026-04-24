@@ -70,6 +70,7 @@ class PlaceRecommenderWorker(Worker[None]):
         try:
             data = extract_message_data(params["message"])
             llm = get_llm_client()
+            collected_candidates: list[dict[str, Any]] = []
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -105,13 +106,29 @@ class PlaceRecommenderWorker(Worker[None]):
                         }
                     )
                     for tc in tool_calls:
-                        args = json.loads(tc.function.arguments)
-                        if tc.function.name == "search_places":
-                            tool_result = await search_places(**args)
-                        elif tc.function.name == "geocode_city":
-                            tool_result = await geocode_city(**args)
+                        name = tc.function.name
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            tool_result = {
+                                "error": f"Invalid arguments for tool {name}: {exc}"
+                            }
                         else:
-                            tool_result = {"error": f"Unknown tool: {tc.function.name}"}
+                            try:
+                                if name == "search_places":
+                                    tool_result = await search_places(**args)
+                                elif name == "geocode_city":
+                                    tool_result = await geocode_city(**args)
+                                else:
+                                    tool_result = {"error": f"Unknown tool: {name}"}
+                            except Exception as exc:
+                                tool_result = {"error": f"Tool {name} failed: {exc}"}
+
+                        if name == "search_places" and isinstance(tool_result, list):
+                            collected_candidates.extend(
+                                p for p in tool_result if isinstance(p, dict)
+                            )
+
                         messages.append(
                             {
                                 "role": "tool",
@@ -121,7 +138,10 @@ class PlaceRecommenderWorker(Worker[None]):
                         )
                 else:
                     raw = choice.message.content or "{}"
-                    result = _parse_json(raw)
+                    result = _coerce_place_result(
+                        _parse_json(raw),
+                        fallback_candidates=collected_candidates,
+                    )
                     await self.storage.update_task(
                         task_id,
                         state="completed",
@@ -129,7 +149,14 @@ class PlaceRecommenderWorker(Worker[None]):
                     )
                     return
 
-            await self.storage.update_task(task_id, state="failed")
+            await self.storage.update_task(
+                task_id,
+                state="completed",
+                new_artifacts=self.build_artifacts(
+                    {"place_candidates": _dedupe_places(collected_candidates)}
+                ),
+            )
+            return
 
         except Exception:
             await self.storage.update_task(task_id, state="failed")
@@ -145,3 +172,53 @@ def _parse_json(text: str) -> dict[str, Any]:
         return json.loads(text)
     except json.JSONDecodeError:
         return {"place_candidates": []}
+
+
+def _coerce_place_result(
+    result: Any,
+    fallback_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"place_candidates": _dedupe_places(fallback_candidates)}
+
+    place_candidates = result.get("place_candidates")
+    if not isinstance(place_candidates, list):
+        result["place_candidates"] = _dedupe_places(fallback_candidates)
+        return result
+
+    valid_candidates = [p for p in place_candidates if isinstance(p, dict)]
+    if valid_candidates:
+        result["place_candidates"] = _dedupe_places(valid_candidates)
+        return result
+
+    result["place_candidates"] = _dedupe_places(fallback_candidates)
+    return result
+
+
+def _dedupe_places(
+    places: list[dict[str, Any]],
+    max_items: int = 20,
+) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for place in places:
+        place_id = str(place.get("id") or "").strip()
+        if place_id:
+            key = f"id:{place_id}"
+        else:
+            loc = place.get("location", {})
+            lat = loc.get("latitude") if isinstance(loc, dict) else None
+            lng = loc.get("longitude") if isinstance(loc, dict) else None
+            name = str(place.get("name") or "").strip().lower()
+            key = f"name:{name}|lat:{lat}|lng:{lng}"
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(place)
+        if len(deduped) >= max_items:
+            break
+
+    return deduped

@@ -1,7 +1,7 @@
 """Tests for agent1 tools – Google API calls mocked."""
 from __future__ import annotations
 import importlib.util, pathlib, sys, os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 _AGENT_DIR = pathlib.Path(__file__).parent.parent
@@ -37,9 +37,17 @@ async def test_geocode_city_unknown_raises():
 
 @pytest.mark.asyncio
 async def test_search_places_returns_candidates():
-    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC:
+    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC, patch(f"{_MOD_NAME}.httpx.AsyncClient") as AC:
         MC.return_value.geocode.return_value = MOCK_GEOCODE
-        MC.return_value.places.return_value = MOCK_PLACES
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = MOCK_PLACES
+
+        http_client = AsyncMock()
+        http_client.get = AsyncMock(return_value=response)
+        AC.return_value.__aenter__.return_value = http_client
+
         results = await _tools.search_places(query="museums in Paris", city="Paris")
         assert len(results) == 2
         assert results[0]["name"] == "Musée du Louvre"
@@ -48,11 +56,37 @@ async def test_search_places_returns_candidates():
 @pytest.mark.asyncio
 async def test_search_places_caps_at_15():
     many = {"results":[{"place_id":f"p{i}","name":f"P{i}","formatted_address":"","geometry":{"location":{"lat":48.0+i*0.01,"lng":2.0}},"rating":4.0,"types":["tourist_attraction"]} for i in range(25)],"status":"OK"}
-    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC:
+    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC, patch(f"{_MOD_NAME}.httpx.AsyncClient") as AC:
         MC.return_value.geocode.return_value = MOCK_GEOCODE
-        MC.return_value.places.return_value = many
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = many
+
+        http_client = AsyncMock()
+        http_client.get = AsyncMock(return_value=response)
+        AC.return_value.__aenter__.return_value = http_client
+
         results = await _tools.search_places(query="stuff", city="Paris")
         assert len(results) <= 15
+
+
+@pytest.mark.asyncio
+async def test_search_places_non_ok_status_raises():
+    denied = {"results": [], "status": "REQUEST_DENIED", "error_message": "API key invalid"}
+    with patch(f"{_MOD_NAME}.googlemaps.Client") as MC, patch(f"{_MOD_NAME}.httpx.AsyncClient") as AC:
+        MC.return_value.geocode.return_value = MOCK_GEOCODE
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = denied
+
+        http_client = AsyncMock()
+        http_client.get = AsyncMock(return_value=response)
+        AC.return_value.__aenter__.return_value = http_client
+
+        with pytest.raises(RuntimeError, match="Google Places text search failed"):
+            await _tools.search_places(query="museums in Paris", city="Paris")
 
 def test_primary_category_priority():
     assert _tools._primary_category(["museum","tourist_attraction"]) == "museum"

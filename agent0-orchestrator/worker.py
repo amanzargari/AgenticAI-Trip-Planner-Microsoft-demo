@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from fasta2a.worker import Worker
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, cluster_places, recommend_places, schedule_day
+
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are the Trip Planner Orchestrator. You coordinate specialist agents to build a complete trip itinerary.
@@ -60,6 +64,11 @@ After all schedule_day calls are done, assemble the final itinerary and return O
   "schedules": [ <DailySchedule>, ... ]
 }
 
+Important output rules:
+    - Never ask follow-up questions.
+    - Never return plain text explanations.
+    - If there are no candidates or schedules, still return the JSON object above with "schedules": [].
+
 Do NOT hard-code a pipeline: use the tool results to decide next steps adaptively.
 """
 
@@ -94,15 +103,21 @@ class OrchestratorWorker(Worker[None]):
 
         try:
             data = extract_message_data(params["message"])
+            logger.info(
+                "Orchestrator task started task_id=%s payload_keys=%s",
+                task_id,
+                sorted(data.keys()),
+            )
             llm = get_llm_client()
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(data)},
             ]
+            fallback_schedules: list[dict[str, Any]] = []
 
             # Generous iteration budget: recommend + cluster + up to 14 days × schedule_day
-            for _ in range(40):
+            for step in range(40):
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
@@ -110,6 +125,12 @@ class OrchestratorWorker(Worker[None]):
                     tool_choice="auto",
                 )
                 choice = response.choices[0]
+                logger.info(
+                    "Orchestrator LLM step task_id=%s step=%d finish_reason=%s",
+                    task_id,
+                    step + 1,
+                    choice.finish_reason,
+                )
 
                 if choice.finish_reason == "tool_calls":
                     tool_calls = choice.message.tool_calls or []
@@ -131,8 +152,34 @@ class OrchestratorWorker(Worker[None]):
                         }
                     )
                     for tc in tool_calls:
-                        args = json.loads(tc.function.arguments)
                         name = tc.function.name
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            logger.exception(
+                                "Orchestrator tool arguments JSON decode failed task_id=%s tool=%s args=%s",
+                                task_id,
+                                name,
+                                tc.function.arguments,
+                            )
+                            tool_result = {
+                                "error": f"Invalid arguments for tool {name}: {exc}"
+                            }
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "content": json.dumps(tool_result),
+                                    "tool_call_id": tc.id,
+                                }
+                            )
+                            continue
+
+                        logger.info(
+                            "Orchestrator tool call task_id=%s tool=%s arg_keys=%s",
+                            task_id,
+                            name,
+                            sorted(args.keys()),
+                        )
                         try:
                             if name == "recommend_places":
                                 tool_result = await recommend_places(**args)
@@ -143,7 +190,30 @@ class OrchestratorWorker(Worker[None]):
                             else:
                                 tool_result = {"error": f"Unknown tool: {name}"}
                         except Exception as exc:
+                            logger.exception(
+                                "Orchestrator tool execution failed task_id=%s tool=%s args=%s",
+                                task_id,
+                                name,
+                                args,
+                            )
                             tool_result = {"error": str(exc)}
+
+                        if isinstance(tool_result, dict) and tool_result.get("error"):
+                            logger.warning(
+                                "Orchestrator tool returned error task_id=%s tool=%s error=%s",
+                                task_id,
+                                name,
+                                tool_result.get("error"),
+                            )
+                        else:
+                            logger.info(
+                                "Orchestrator tool succeeded task_id=%s tool=%s result_keys=%s",
+                                task_id,
+                                name,
+                                sorted(tool_result.keys()) if isinstance(tool_result, dict) else "non-dict",
+                            )
+                            if name == "schedule_day" and isinstance(tool_result, dict):
+                                fallback_schedules.append(tool_result)
 
                         messages.append(
                             {
@@ -154,7 +224,23 @@ class OrchestratorWorker(Worker[None]):
                         )
                 else:
                     raw = choice.message.content or "{}"
-                    result = _parse_json(raw)
+                    parsed = _parse_json(raw)
+                    result = _normalize_orchestrator_result(
+                        parsed,
+                        request_data=data,
+                        fallback_schedules=fallback_schedules,
+                    )
+                    if isinstance(parsed, dict) and parsed.get("error"):
+                        logger.warning(
+                            "Orchestrator produced error-shaped result task_id=%s error=%s",
+                            task_id,
+                            parsed.get("error"),
+                        )
+                    logger.info(
+                        "Orchestrator task completed task_id=%s result_keys=%s",
+                        task_id,
+                        sorted(result.keys()) if isinstance(result, dict) else "non-dict",
+                    )
                     await self.storage.update_task(
                         task_id,
                         state="completed",
@@ -162,9 +248,21 @@ class OrchestratorWorker(Worker[None]):
                     )
                     return
 
-            await self.storage.update_task(task_id, state="failed")
+            logger.error("Orchestrator task exceeded max iterations task_id=%s", task_id)
+            fallback_result = _normalize_orchestrator_result(
+                {},
+                request_data=data,
+                fallback_schedules=fallback_schedules,
+            )
+            await self.storage.update_task(
+                task_id,
+                state="completed",
+                new_artifacts=self.build_artifacts(fallback_result),
+            )
+            return
 
         except Exception:
+            logger.exception("Orchestrator task crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
 
@@ -177,4 +275,58 @@ def _parse_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        logger.warning(
+            "Orchestrator final response was not valid JSON; excerpt=%s",
+            text[:240],
+        )
         return {"error": "Could not parse orchestrator output", "raw": text}
+
+
+def _normalize_orchestrator_result(
+    result: Any,
+    request_data: dict[str, Any],
+    fallback_schedules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    src = result if isinstance(result, dict) else {}
+
+    fallback_city = str(request_data.get("city") or "")
+    fallback_trip_start = str(request_data.get("trip_start") or "")
+    fallback_trip_end = str(request_data.get("trip_end") or "")
+    fallback_total_budget = _extract_total_budget(request_data)
+
+    schedules = src.get("schedules")
+    if isinstance(schedules, list):
+        valid_schedules = [s for s in schedules if isinstance(s, dict)]
+        schedules = valid_schedules or [s for s in fallback_schedules if isinstance(s, dict)]
+    else:
+        schedules = [s for s in fallback_schedules if isinstance(s, dict)]
+
+    total_budget = src.get("total_budget")
+    if total_budget is None:
+        total_budget = fallback_total_budget
+    elif not isinstance(total_budget, (int, float)):
+        try:
+            total_budget = float(total_budget)
+        except (TypeError, ValueError):
+            total_budget = fallback_total_budget
+
+    return {
+        "city": str(src.get("city") or fallback_city),
+        "trip_start": str(src.get("trip_start") or fallback_trip_start),
+        "trip_end": str(src.get("trip_end") or fallback_trip_end),
+        "total_budget": total_budget,
+        "schedules": schedules,
+    }
+
+
+def _extract_total_budget(request_data: dict[str, Any]) -> float | None:
+    budget = request_data.get("budget")
+    if isinstance(budget, dict):
+        value = budget.get("total_budget")
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return None
