@@ -61,12 +61,13 @@ Input (JSON):
 - trip_end: ISO datetime
 - budget: float | null (activity budget in EUR)
 - trip_reason: string | null
-- preferences: list[str]
+- preferences: free-text user notes — treat as context, not structured tags.
+  Examples: "loves art and history", "hates crowded tourist traps", "outdoor activities preferred".
 
 Tool strategy:
 1) Call geocode_city(city) once to anchor location context.
 2) Call search_places multiple times with varied intent:
-     - preference-focused queries (art, museums, outdoors, nightlife, etc.)
+     - preference-focused queries based on liked interests from the preferences note
      - broad fallback query like "top attractions in <city>"
      - optional place_type when helpful, but do not rely on one type only
 3) Target 3-6 searches total when possible.
@@ -74,7 +75,9 @@ Tool strategy:
 5) Deduplicate and keep the strongest candidates (quality + diversity).
 
 Ranking guidance:
-- Prefer places matching preferences and trip_reason.
+- EXCLUDE place categories the user explicitly hates (e.g. if preferences say "hate beaches",
+  omit beach/coastal attractions entirely).
+- PREFER places matching liked interests and trip_reason.
 - Prefer higher-rated places when ratings exist.
 - Keep a mix of categories to avoid repetitive itineraries.
 - Return 10-20 items when available; otherwise return as many as found.

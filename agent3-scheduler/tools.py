@@ -304,7 +304,7 @@ TOOLS: list[dict[str, Any]] = [
             "strict": True,
             "description": (
                 "Ask the Food Recommender agent for restaurant suggestions near a location. "
-                "Call once for lunch and once for dinner."
+                "Call once for each meal: breakfast, lunch, and dinner."
             ),
             "parameters": {
                 "type": "object",
@@ -330,14 +330,14 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "budget_per_meal_per_person": {
                         "anyOf": [{"type": "number"}, {"type": "null"}],
-                        "description": "Budget per meal per person in EUR (null = no limit).",
+                        "description": "Budget per meal per person in EUR (food_budget_per_day / 3; null = no limit).",
                     },
                     "preferences": {
                         "anyOf": [
                             {"type": "array", "items": {"type": "string"}},
                             {"type": "null"},
                         ],
-                        "description": "Dietary or cuisine preferences.",
+                        "description": "Dietary restrictions or cuisine preferences from user notes.",
                     },
                 },
                 "required": ["time_of_day", "search_center", "search_radius_meters", "budget_per_meal_per_person", "preferences"],
