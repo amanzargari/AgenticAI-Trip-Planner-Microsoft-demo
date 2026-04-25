@@ -8,11 +8,58 @@ from __future__ import annotations
 import json
 import math
 import os
+import uuid
 from typing import Any
 import asyncio
 import httpx
 
 from shared.a2a_utils import call_agent
+
+_PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+_SLOT_KEYWORDS = {"breakfast": "breakfast cafe", "lunch": "lunch restaurant", "dinner": "dinner restaurant"}
+
+
+async def _search_restaurants_direct(
+    latitude: float,
+    longitude: float,
+    meal_slot: str,
+    radius_meters: int = 1000,
+) -> list[dict[str, Any]]:
+    """Direct Google Places restaurant search used as fallback when Agent 4 returns nothing."""
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key or not latitude or not longitude:
+        return []
+    params = {
+        "location": f"{latitude},{longitude}",
+        "radius": radius_meters,
+        "type": "restaurant",
+        "keyword": _SLOT_KEYWORDS.get(meal_slot, "restaurant"),
+        "key": api_key,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(_PLACES_NEARBY_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return []
+    results = []
+    for place in data.get("results", [])[:5]:
+        geo = place.get("geometry", {}).get("location", {})
+        results.append({
+            "id": place.get("place_id", str(uuid.uuid4())),
+            "name": place.get("name", "Unknown"),
+            "location": {
+                "latitude": geo.get("lat", 0.0),
+                "longitude": geo.get("lng", 0.0),
+                "address": place.get("vicinity"),
+            },
+            "price_level": place.get("price_level"),
+            "cuisines": None,
+            "rating": place.get("rating"),
+            "summary": None,
+        })
+    return results
 
 AGENT4_URL: str = os.getenv("AGENT4_URL", "http://localhost:8004")
 
@@ -125,11 +172,11 @@ def _coerce_places(raw: Any) -> list[dict[str, Any]]:
 async def recommend_restaurant(
     time_of_day: str,
     search_center: dict[str, float],
-    search_radius_meters: int = 500,
+    search_radius_meters: int = 1000,
     budget_per_meal_per_person: float | None = None,
     preferences: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Call Agent 4 (Food Recommender) via A2A and return restaurant candidates."""
+    """Call Agent 4 (Food Recommender) via A2A; fall back to direct Places search if empty."""
     payload: dict[str, Any] = {
         "time_of_day": time_of_day,
         "search_center": search_center,
@@ -141,8 +188,20 @@ async def recommend_restaurant(
         max_price = min(3, max(0, int(budget_per_meal_per_person / 15)))
         payload["max_price_level"] = max_price
 
-    result = await call_agent(AGENT4_URL, payload)
-    return result.get("restaurants", [])
+    try:
+        result = await call_agent(AGENT4_URL, payload)
+        restaurants = result.get("restaurants", [])
+    except Exception:
+        restaurants = []
+
+    # If Agent 4 returned nothing or crashed, search Google Places directly
+    if not restaurants:
+        lat = float(search_center.get("latitude") or 0)
+        lng = float(search_center.get("longitude") or 0)
+        slot = time_of_day if time_of_day in ("breakfast", "lunch", "dinner") else "lunch"
+        restaurants = await _search_restaurants_direct(lat, lng, slot, search_radius_meters or 1000)
+
+    return restaurants
 
 _PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 

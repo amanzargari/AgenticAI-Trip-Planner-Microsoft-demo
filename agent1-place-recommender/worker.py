@@ -17,6 +17,8 @@ from shared.llm import DEFAULT_MODEL, get_llm_client
 from shared.models import PlaceCandidate
 from tools import TOOLS, geocode_city, search_places
 
+MODEL = os.getenv("AGENT1_MODEL", DEFAULT_MODEL)
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,13 +36,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-AGENT1_MAX_TOOL_STEPS = _env_int("AGENT1_MAX_TOOL_STEPS", 8)
-AGENT1_MAX_TOOL_CALLS = _env_int("AGENT1_MAX_TOOL_CALLS", 12)
-AGENT1_MAX_SEARCH_CALLS = _env_int("AGENT1_MAX_SEARCH_CALLS", 6)
+AGENT1_MAX_TOOL_STEPS = _env_int("AGENT1_MAX_TOOL_STEPS", 12)
+AGENT1_MAX_TOOL_CALLS = _env_int("AGENT1_MAX_TOOL_CALLS", 20)
+AGENT1_MAX_SEARCH_CALLS = _env_int("AGENT1_MAX_SEARCH_CALLS", 10)
 AGENT1_TOOL_TIMEOUT_SEC = _env_float("AGENT1_TOOL_TIMEOUT_SEC", 20.0)
-AGENT1_TASK_BUDGET_SEC = _env_float("AGENT1_TASK_BUDGET_SEC", 90.0)
-AGENT1_MIN_CANDIDATES_EARLY_EXIT = _env_int("AGENT1_MIN_CANDIDATES_EARLY_EXIT", 12)
-AGENT1_FALLBACK_MAX_QUERIES = _env_int("AGENT1_FALLBACK_MAX_QUERIES", 4)
+AGENT1_TASK_BUDGET_SEC = _env_float("AGENT1_TASK_BUDGET_SEC", 120.0)
+AGENT1_MIN_CANDIDATES_EARLY_EXIT = _env_int("AGENT1_MIN_CANDIDATES_EARLY_EXIT", 30)
+AGENT1_FALLBACK_MAX_QUERIES = _env_int("AGENT1_FALLBACK_MAX_QUERIES", 6)
 
 
 # ── Structured output model ───────────────────────────────────────────────────
@@ -53,7 +55,7 @@ class PlaceOutput(BaseModel):
 
 SYSTEM_PROMPT = """\
 You are the Place Recommender Agent.
-Goal: produce a high-quality, diverse list of places to visit for a trip.
+Goal: produce a high-quality, diverse list of places to visit for a trip — always including the city's most iconic landmarks.
 
 Input (JSON):
 - city: destination city
@@ -66,21 +68,24 @@ Input (JSON):
 
 Tool strategy:
 1) Call geocode_city(city) once to anchor location context.
-2) Call search_places multiple times with varied intent:
-     - preference-focused queries based on liked interests from the preferences note
-     - broad fallback query like "top attractions in <city>"
-     - optional place_type when helpful, but do not rely on one type only
-3) Target 3-6 searches total when possible.
-4) If any tool call fails, continue with other searches.
-5) Deduplicate and keep the strongest candidates (quality + diversity).
+2) MANDATORY first two searches (always run both regardless of preferences):
+     - "famous landmarks in {city}" — captures must-see iconic places every visitor expects
+     - "top tourist attractions in {city}" — broad coverage of highly-rated places
+3) Then run 2-3 preference-focused searches based on user interests, e.g.:
+     - If user likes art: "art museums in {city}"
+     - If user likes outdoor: "parks and nature in {city}"
+     - Use place_type when it improves specificity
+4) Target 4-6 searches total.
+5) If any tool call fails, continue with remaining searches.
+6) Deduplicate and keep the strongest candidates (quality + diversity).
 
 Ranking guidance:
+- FIRST prioritize famous, iconic landmarks the city is known for (Duomo, Eiffel Tower, etc.) — high rating ≥ 4.0 preferred.
 - EXCLUDE place categories the user explicitly hates (e.g. if preferences say "hate beaches",
   omit beach/coastal attractions entirely).
 - PREFER places matching liked interests and trip_reason.
-- Prefer higher-rated places when ratings exist.
 - Keep a mix of categories to avoid repetitive itineraries.
-- Return 10-20 items when available; otherwise return as many as found.
+- Return 20-40 items when available; otherwise return as many as found.
 - If no usable results are found, return an empty list.
 """
 
@@ -141,7 +146,7 @@ class PlaceRecommenderWorker(Worker[None]):
                     max(5.0, AGENT1_TOOL_TIMEOUT_SEC),
                 )
                 response = await llm.chat.completions.create(
-                    model=DEFAULT_MODEL,
+                    model=MODEL,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto" if tool_called else "required",
@@ -152,18 +157,7 @@ class PlaceRecommenderWorker(Worker[None]):
                 if choice.finish_reason == "tool_calls":
                     tool_called = True
                     tool_calls = choice.message.tool_calls or []
-                    messages.append({
-                        "role": "assistant",
-                        "content": choice.message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                            }
-                            for tc in tool_calls
-                        ],
-                    })
+                    messages.append(choice.message.model_dump(exclude_none=True))
                     for tc in tool_calls:
                         if tool_calls_executed >= max(1, AGENT1_MAX_TOOL_CALLS):
                             stop_phase_1 = True
@@ -250,7 +244,7 @@ class PlaceRecommenderWorker(Worker[None]):
                     )
                     final = await asyncio.wait_for(
                         llm.beta.chat.completions.parse(
-                            model=DEFAULT_MODEL,
+                            model=MODEL,
                             messages=messages,
                             response_format=PlaceOutput,
                             timeout=parse_timeout,
@@ -279,11 +273,13 @@ class PlaceRecommenderWorker(Worker[None]):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _coerce_candidates(raw: list[dict[str, Any]], max_items: int = 20) -> list[PlaceCandidate]:
-    """Best-effort coercion of raw place dicts into PlaceCandidate, deduped."""
+def _coerce_candidates(raw: list[dict[str, Any]], max_items: int = 40) -> list[PlaceCandidate]:
+    """Best-effort coercion of raw place dicts into PlaceCandidate, deduped, sorted by rating."""
+    # Sort highest-rated first so iconic landmarks (usually high-rated) are prioritised
+    raw_sorted = sorted(raw, key=lambda p: -(float(p.get("rating") or 0)))
     seen: set[str] = set()
     out: list[PlaceCandidate] = []
-    for place in raw:
+    for place in raw_sorted:
         key = str(place.get("id") or place.get("name", "")).strip().lower()
         if key in seen:
             continue

@@ -109,7 +109,7 @@ async def search_places(
             }
         )
 
-    return results[:15]
+    return results[:20]
 
 
 def _primary_category(types: list[str]) -> str:

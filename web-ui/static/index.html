@@ -204,6 +204,27 @@ input:focus { outline: none; border-color: var(--accent); }
 .event-meta { font-size: .76rem; color: var(--muted); }
 .stars { color: #ffd700; }
 
+/* Day card slide-in animation */
+.day-card-entering {
+  opacity: 0;
+  transform: translateY(14px);
+  transition: opacity .38s ease, transform .38s ease;
+}
+.day-card-entering.day-card-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Streaming progress bar inside summary */
+.streaming-status {
+  display: flex; align-items: center; gap: 8px;
+  font-size: .78rem; color: var(--muted); padding: 2px 0;
+}
+.streaming-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1s infinite;
+}
+
 /* Empty state */
 .empty-state {
   display: flex; flex-direction: column; align-items: center;
@@ -393,6 +414,7 @@ pre.trace-json {
 let currentItinerary = null;
 let originalParams   = null;
 let isWorking        = false;
+let activeEventSource = null;
 
 // ── Agent status ──────────────────────────────────────────────────────────────
 async function checkAgents() {
@@ -417,7 +439,7 @@ function selectedPrefs() {
   return raw.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
 }
 
-// ── Initial plan ──────────────────────────────────────────────────────────────
+// ── Initial plan (streaming) ──────────────────────────────────────────────────
 async function submitPlan() {
   const city  = document.getElementById('city').value.trim();
   const start = document.getElementById('trip_start').value;
@@ -449,8 +471,13 @@ async function submitPlan() {
   setWorking(true);
   appendTyping();
 
+  // Close any previous SSE connection
+  if (activeEventSource) { activeEventSource.close(); activeEventSource = null; }
+
+  // Step 1: submit task, get task_id
+  let taskId;
   try {
-    const res = await fetch('/api/plan', {
+    const res = await fetch('/api/plan/submit', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -462,32 +489,135 @@ async function submitPlan() {
         preferences:  prefs,
       }),
     });
-    removeTyping();
-
     if (!res.ok) {
       const err = await res.json();
+      removeTyping();
       appendAiMsg(`Sorry, something went wrong: ${err.detail || 'HTTP ' + res.status}`);
+      setWorking(false);
       return;
     }
-
     const data = await res.json();
-    currentItinerary = data;
-
-    const days = (data.schedules || []).length;
-    appendAiMsg(
-      `I've planned your ${days}-day trip to <strong>${esc(data.city || city)}</strong>! ` +
-      `Check the itinerary panel. ` +
-      `Ask me for changes — e.g. <em>"add more museums"</em> or <em>"vegetarian restaurants only"</em>.`
-    );
-    renderItinerary(data);
-    renderTrace(data.trace || []);
-    showChatInput();
-
+    taskId = data.task_id;
   } catch (e) {
     removeTyping();
     appendAiMsg('Request failed: ' + esc(e.message));
-  } finally {
     setWorking(false);
+    return;
+  }
+
+  // Step 2: open SSE stream — show itinerary panel immediately
+  removeTyping();
+  let dayCount = 0;
+  let allTrace = [];
+  initStreamingItinerary(city);
+
+  const es = new EventSource(`/api/plan/stream/${taskId}`);
+  activeEventSource = es;
+
+  es.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'day') {
+      dayCount++;
+      appendDayCard(msg.schedule, dayCount);
+      updateStreamingStatus(`Scheduling day ${dayCount}…`);
+
+    } else if (msg.type === 'trace') {
+      allTrace = allTrace.concat(msg.events);
+      renderTrace(allTrace);
+
+    } else if (msg.type === 'done') {
+      es.close();
+      activeEventSource = null;
+      const itin = msg.itinerary;
+      currentItinerary = itin;
+      const days = (itin.schedules || []).length;
+      appendAiMsg(
+        `I've planned your ${days}-day trip to <strong>${esc(itin.city || city)}</strong>! ` +
+        `Ask me for changes — e.g. <em>"add more museums"</em> or <em>"vegetarian restaurants only"</em>.`
+      );
+      finalizeStreamingItinerary(itin);
+      renderTrace(itin.trace || []);
+      showChatInput();
+      setWorking(false);
+
+    } else if (msg.type === 'error') {
+      es.close();
+      activeEventSource = null;
+      appendAiMsg(`Sorry, planning failed: ${esc(msg.message)}`);
+      updateStreamingStatus('Failed — see chat for details.');
+      setWorking(false);
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    activeEventSource = null;
+    if (isWorking) {
+      appendAiMsg('Connection lost during planning.');
+      setWorking(false);
+    }
+  };
+}
+
+// ── Streaming itinerary helpers ───────────────────────────────────────────────
+function initStreamingItinerary(city) {
+  const hdr = document.getElementById('itin-header');
+  hdr.classList.add('has-data');
+  document.getElementById('itin-title').textContent = `Planning ${city}…`;
+  document.getElementById('itin-scroll').innerHTML = `
+    <div class="summary-bar" id="summary-bar">
+      ${si('City', city)}
+      <div class="summary-item">
+        <span class="summary-label">Status</span>
+        <div class="streaming-status" id="streaming-status">
+          <span class="streaming-dot"></span>
+          <span id="streaming-status-text">Finding places…</span>
+        </div>
+      </div>
+    </div>
+    <div id="day-cards"></div>`;
+}
+
+function updateStreamingStatus(text) {
+  const el = document.getElementById('streaming-status-text');
+  if (el) el.textContent = text;
+}
+
+function appendDayCard(day, idx) {
+  const container = document.getElementById('day-cards');
+  if (!container) return;
+  const date = day.date || `Day ${idx}`;
+  const div = document.createElement('div');
+  div.className = 'day-card day-card-entering';
+  div.id = `day-card-${idx}`;
+  div.innerHTML = `
+    <div class="day-header">
+      <span class="day-badge">Day ${idx}</span>
+      ${esc(fmtDateLong(date))}
+    </div>
+    ${(day.events || []).map(renderEvent).join('')}`;
+  container.appendChild(div);
+  // scroll the new card into view inside the panel
+  const scroll = document.getElementById('itin-scroll');
+  if (scroll) setTimeout(() => { scroll.scrollTop = scroll.scrollHeight; }, 50);
+  // trigger CSS transition
+  requestAnimationFrame(() => requestAnimationFrame(() => div.classList.add('day-card-visible')));
+}
+
+function finalizeStreamingItinerary(data) {
+  const schedules   = data.schedules || [];
+  const totalEvents = schedules.reduce((n, d) => n + (d.events || []).length, 0);
+  document.getElementById('itin-title').textContent =
+    `${data.city || ''} — ${schedules.length} day${schedules.length !== 1 ? 's' : ''}`;
+  const bar = document.getElementById('summary-bar');
+  if (bar) {
+    bar.innerHTML = [
+      data.city         ? si('City', data.city) : '',
+      si('Days', schedules.length),
+      si('Events', totalEvents),
+      data.total_budget ? si('Budget', `€${Math.round(data.total_budget)}`) : '',
+    ].filter(Boolean).join('');
   }
 }
 
@@ -575,7 +705,7 @@ function setWorking(v) {
 }
 function showChatInput() { document.getElementById('input-bar').style.display = 'flex'; }
 
-// ── Itinerary render ──────────────────────────────────────────────────────────
+// ── Itinerary render (used by chat modifications — replaces entire panel) ─────
 function renderItinerary(data) {
   const schedules   = data.schedules || [];
   const totalEvents = schedules.reduce((n, d) => n + (d.events || []).length, 0);
@@ -770,7 +900,6 @@ function countLabel2(tool, out) {
 
 // ── JSON syntax highlighting ──────────────────────────────────────────────────
 function syntaxHighlight(json) {
-  // Escape HTML entities first
   json = json.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   return json.replace(
     /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,

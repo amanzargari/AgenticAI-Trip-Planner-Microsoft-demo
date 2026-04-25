@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,8 @@ from fasta2a.worker import Worker
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, cluster_places, recommend_places, schedule_day
+
+MODEL = os.getenv("AGENT0_MODEL", DEFAULT_MODEL)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,7 @@ Available tools:
      → {"date": "YYYY-MM-DD", "events": [...]}
 
 IMPORTANT: when calling schedule_day, pass each cluster's place objects from cluster_places output VERBATIM (with id, name, location, etc.). Never pass only IDs or strings — agent3 will return empty events.
+IMPORTANT: clusters are pre-sorted by iconicity — cluster 0 contains the most famous/iconic places. Schedule them in order: cluster 0 = day 1, cluster 1 = day 2, etc. so iconic landmarks always appear first.
 
 Execution rules:
 - Always call recommend_places before cluster_places; cluster_places before schedule_day.
@@ -117,6 +121,7 @@ class OrchestratorWorker(Worker[None]):
             collected_schedules: list[dict[str, Any]] = []
             trace_events: list[dict[str, Any]] = []
             schedule_day_failures: dict[str, int] = {}
+            expected_schedule_count: int = 0  # set after cluster_places returns
 
             is_initial = "modification_request" not in data
             called_tools: set[str] = set()
@@ -129,7 +134,11 @@ class OrchestratorWorker(Worker[None]):
                         tool_choice: Any = {"type": "function", "function": {"name": "recommend_places"}}
                     elif "cluster_places" not in called_tools:
                         tool_choice = {"type": "function", "function": {"name": "cluster_places"}}
+                    elif expected_schedule_count > 0 and len(collected_schedules) < expected_schedule_count:
+                        # Still more days to schedule — force another tool call
+                        tool_choice = "required"
                     elif not collected_schedules:
+                        # cluster_places not processed yet — keep forcing
                         tool_choice = "required"
                     else:
                         tool_choice = "auto"
@@ -137,7 +146,7 @@ class OrchestratorWorker(Worker[None]):
                     tool_choice = "required" if step == 0 else "auto"
 
                 response = await llm.chat.completions.create(
-                    model=DEFAULT_MODEL,
+                    model=MODEL,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice=tool_choice,
@@ -147,18 +156,7 @@ class OrchestratorWorker(Worker[None]):
 
                 if choice.finish_reason == "tool_calls":
                     tool_calls = choice.message.tool_calls or []
-                    messages.append({
-                        "role": "assistant",
-                        "content": choice.message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                            }
-                            for tc in tool_calls
-                        ],
-                    })
+                    messages.append(choice.message.model_dump(exclude_none=True))
 
                     for tc in tool_calls:
                         name = tc.function.name
@@ -183,6 +181,15 @@ class OrchestratorWorker(Worker[None]):
                                 tool_result = await recommend_places(**args)
                             elif name == "cluster_places":
                                 tool_result = await cluster_places(**args)
+                                # Track how many days need scheduling so tool_choice stays
+                                # "required" until every cluster has a schedule_day call.
+                                clusters = tool_result.get("clustered_place_candidates", [])
+                                if isinstance(clusters, list):
+                                    expected_schedule_count = len(clusters)
+                                    logger.info(
+                                        "Orchestrator cluster_places → %d clusters task_id=%s",
+                                        expected_schedule_count, task_id,
+                                    )
                             elif name == "schedule_day":
                                 day_key = str(args.get("day_start", ""))[:10]
                                 if schedule_day_failures.get(day_key, 0) >= 2:
@@ -210,12 +217,18 @@ class OrchestratorWorker(Worker[None]):
                         status = "skipped" if skipped else ("error" if is_error else "success")
                         trace_events.append(_trace(name, args, tool_result, status))
 
-                        # Push intermediate trace so the UI can poll for real-time updates
+                        # Push partial result after every tool so UI can stream day-by-day
                         try:
+                            _pm = _meta_from_request(data)
                             await self.storage.update_task(
                                 task_id,
                                 state="working",
-                                new_artifacts=[make_data_artifact({"partial_trace": trace_events})],
+                                new_artifacts=[make_data_artifact({
+                                    "partial": True,
+                                    **_pm,
+                                    "schedules": list(collected_schedules),
+                                    "trace": list(trace_events),
+                                })],
                             )
                         except Exception:
                             pass

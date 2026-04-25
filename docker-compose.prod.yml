@@ -1,0 +1,26 @@
+# Production overrides — layer on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Changes from base:
+#   • Agent ports (8000–8004) are NOT exposed — only reachable inside Docker network.
+#   • web-ui is exposed on port 80 (public-facing) instead of 3000.
+
+services:
+  agent4:
+    ports: !reset []
+
+  agent1:
+    ports: !reset []
+
+  agent2:
+    ports: !reset []
+
+  agent3:
+    ports: !reset []
+
+  orchestrator:
+    ports: !reset []
+
+  web-ui:
+    ports:
+      - "80:3000"

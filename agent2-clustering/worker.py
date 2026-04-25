@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,8 @@ from fasta2a.worker import Worker
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, cluster_places, num_days_from_dates
+
+MODEL = os.getenv("AGENT2_MODEL", DEFAULT_MODEL)
 
 
 logger = logging.getLogger(__name__)
@@ -113,7 +116,7 @@ class ClusteringWorker(Worker[None]):
             tool_called_2 = False
             for _ in range(6):
                 response = await llm.chat.completions.create(
-                    model=DEFAULT_MODEL,
+                    model=MODEL,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto" if tool_called_2 else "required",
@@ -123,23 +126,7 @@ class ClusteringWorker(Worker[None]):
                 if choice.finish_reason == "tool_calls":
                     tool_called_2 = True
                     tool_calls = choice.message.tool_calls or []
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": choice.message.content,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments,
-                                    },
-                                }
-                                for tc in tool_calls
-                            ],
-                        }
-                    )
+                    messages.append(choice.message.model_dump(exclude_none=True))
                     for tc in tool_calls:
                         try:
                             args = json.loads(tc.function.arguments)

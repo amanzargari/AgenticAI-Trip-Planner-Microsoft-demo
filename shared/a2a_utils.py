@@ -14,6 +14,29 @@ from fasta2a.schema import Artifact, Message
 logger = logging.getLogger(__name__)
 
 
+async def submit_agent_task(
+    url: str,
+    data: dict[str, Any],
+    context_id: str | None = None,
+) -> str:
+    """Submit a task to an A2A agent and return task_id immediately (no waiting)."""
+    cid = context_id or str(uuid.uuid4())
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+        client = A2AClient(url, http_client=http_client)
+        message: Message = {
+            "role": "user",
+            "kind": "message",
+            "message_id": str(uuid.uuid4()),
+            "context_id": cid,
+            "parts": [{"kind": "data", "data": data}],
+        }
+        response = await client.send_message(message)
+        if response.get("error"):
+            raise RuntimeError(f"Agent error on send: {response['error']}")
+        task = response["result"]
+        return task["id"]
+
+
 async def call_agent(
     url: str,
     data: dict[str, Any],
@@ -187,7 +210,10 @@ def _extract_artifact_payload(
 
 
 def _is_partial_trace_payload(payload: dict[str, Any]) -> bool:
-    return isinstance(payload, dict) and set(payload.keys()) == {"partial_trace"}
+    return isinstance(payload, dict) and (
+        set(payload.keys()) == {"partial_trace"}
+        or payload.get("partial") is True
+    )
 
 
 def _short(value: Any, max_len: int = 240) -> str:

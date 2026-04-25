@@ -45,21 +45,23 @@ def cluster_places(
 
     try:
         for _ in range(100):
-            # Assignment step
             dist_matrix = np.stack(
                 [_haversine_all(coords, c) for c in centers], axis=1
             )
-            assignments = np.argmin(dist_matrix, axis=1)
+            raw_assignments = np.argmin(dist_matrix, axis=1)
 
-            # Update step
             new_centers = np.zeros_like(centers)
             for ci in range(k):
-                members = coords[assignments == ci]
+                members = coords[raw_assignments == ci]
                 new_centers[ci] = members.mean(axis=0) if len(members) else centers[ci]
 
             if np.allclose(centers, new_centers, atol=1e-8):
                 break
             centers = new_centers
+
+        # Balanced assignment: each cluster gets floor(n/k) or ceil(n/k) places.
+        # This prevents one cluster having 8 places while another has 1.
+        assignments = _balanced_assign(coords, centers, k)
 
         clusters: list[list[dict[str, Any]]] = [[] for _ in range(k)]
         for i, place in enumerate(places):
@@ -67,12 +69,19 @@ def cluster_places(
 
         result = [c for c in clusters if c]
         if result:
-            return result
+            return _sort_clusters_by_rating(result)
     except Exception:
         pass
 
-    # Fallback: round-robin when k-means fails (e.g. degenerate coordinates)
-    return _round_robin_clusters(places, k)
+    return _sort_clusters_by_rating(_round_robin_clusters(places, k))
+
+
+def _sort_clusters_by_rating(clusters: list[list[dict]]) -> list[list[dict]]:
+    """Sort clusters so the one with the highest average rating comes first (day 1 = iconic places)."""
+    def _avg(cluster: list[dict]) -> float:
+        ratings = [float(p.get("rating") or 0) for p in cluster]
+        return sum(ratings) / len(ratings) if ratings else 0.0
+    return sorted(clusters, key=lambda c: -_avg(c))
 
 
 def _round_robin_clusters(
@@ -84,6 +93,43 @@ def _round_robin_clusters(
     for i, place in enumerate(places):
         buckets[i % k].append(place)
     return [b for b in buckets if b]
+
+
+def _balanced_assign(coords: np.ndarray, centers: np.ndarray, k: int) -> np.ndarray:
+    """Greedy balanced assignment: each cluster gets floor(n/k) or ceil(n/k) places.
+
+    Processes (place, cluster) pairs sorted by distance so geographically close
+    assignments are preferred, but every cluster fills to its target capacity.
+    Prevents k-means from creating clusters of sizes like [8, 1, 1, 2, 3].
+    """
+    n = len(coords)
+    base = n // k
+    extras = n % k
+    capacities = [base + 1 if i < extras else base for i in range(k)]
+
+    dist_matrix = np.stack([_haversine_all(coords, c) for c in centers], axis=1)
+
+    assignments = np.full(n, -1, dtype=int)
+    place_assigned = [False] * n
+    cluster_count = [0] * k
+
+    rows, cols = np.indices(dist_matrix.shape)
+    order = np.argsort(dist_matrix.ravel())
+
+    for idx in order:
+        pi = int(rows.ravel()[idx])
+        ci = int(cols.ravel()[idx])
+        if place_assigned[pi]:
+            continue
+        if cluster_count[ci] >= capacities[ci]:
+            continue
+        assignments[pi] = ci
+        place_assigned[pi] = True
+        cluster_count[ci] += 1
+        if all(place_assigned):
+            break
+
+    return assignments
 
 
 def _extract_coords(places: list[dict[str, Any]]) -> np.ndarray | None:

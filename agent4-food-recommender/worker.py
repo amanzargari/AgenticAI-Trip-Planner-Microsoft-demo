@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
+
+MODEL = os.getenv("AGENT4_MODEL", DEFAULT_MODEL)
 from shared.models import RestaurantCandidate
 from tools import TOOLS, search_restaurants
 
@@ -89,7 +92,7 @@ class FoodRecommenderWorker(Worker[None]):
             tool_called = False
             for _ in range(8):
                 response = await llm.chat.completions.create(
-                    model=DEFAULT_MODEL,
+                    model=MODEL,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto" if tool_called else "required",
@@ -99,18 +102,7 @@ class FoodRecommenderWorker(Worker[None]):
                 if choice.finish_reason == "tool_calls":
                     tool_called = True
                     tool_calls = choice.message.tool_calls or []
-                    messages.append({
-                        "role": "assistant",
-                        "content": choice.message.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                            }
-                            for tc in tool_calls
-                        ],
-                    })
+                    messages.append(choice.message.model_dump(exclude_none=True))
                     for tc in tool_calls:
                         try:
                             args = json.loads(tc.function.arguments)
@@ -135,7 +127,7 @@ class FoodRecommenderWorker(Worker[None]):
             # Phase 2: structured output — no tools so response_format works without conflict
             try:
                 final = await llm.beta.chat.completions.parse(
-                    model=DEFAULT_MODEL,
+                    model=MODEL,
                     messages=messages,
                     response_format=FoodOutput,
                 )
