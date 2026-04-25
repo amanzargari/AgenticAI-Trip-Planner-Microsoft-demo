@@ -1,4 +1,4 @@
-"""Regression tests for agent1 worker safety fallbacks."""
+"""Regression tests for agent1 worker helper behavior."""
 from __future__ import annotations
 
 import importlib.util
@@ -12,11 +12,22 @@ import pytest
 
 _AGENT_DIR = pathlib.Path(__file__).parent.parent
 _ROOT_DIR = _AGENT_DIR.parent
-for _d in (str(_ROOT_DIR),):
-    if _d not in sys.path:
-        sys.path.insert(0, _d)
+
+for mod in list(sys.modules):
+    if mod in ("tools", "worker") or mod.startswith("tools."):
+        del sys.modules[mod]
+
+for _d in (str(_AGENT_DIR), str(_ROOT_DIR)):
+    if _d in sys.path:
+        sys.path.remove(_d)
+    sys.path.insert(0, _d)
 
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
+
+_TOOLS_SPEC = importlib.util.spec_from_file_location("tools", _AGENT_DIR / "tools.py")
+_tools = importlib.util.module_from_spec(_TOOLS_SPEC)
+sys.modules["tools"] = _tools
+_TOOLS_SPEC.loader.exec_module(_tools)
 
 _MOD_NAME = "agent1_worker"
 _spec = importlib.util.spec_from_file_location(_MOD_NAME, _AGENT_DIR / "worker.py")
@@ -26,13 +37,14 @@ _spec.loader.exec_module(_worker)
 
 
 def _place(
-    pid: str | None,
+    pid: str,
     *,
     name: str = "Some Place",
     lat: float = 45.4642,
     lng: float = 9.19,
 ) -> dict:
-    data = {
+    return {
+        "id": pid,
         "name": name,
         "location": {"latitude": lat, "longitude": lng, "address": ""},
         "estimated_visit_duration_minutes": 60,
@@ -41,69 +53,79 @@ def _place(
         "rating": 4.2,
         "summary": "",
     }
-    if pid is not None:
-        data["id"] = pid
-    return data
 
 
-def test_dedupe_places_by_id_and_fallback_key() -> None:
+def test_coerce_candidates_dedupes_and_skips_invalid() -> None:
     p1 = _place("louvre", name="Louvre")
     p1_dup = _place("louvre", name="Louvre Museum")
-    p2 = _place(None, name="Duomo", lat=45.4641, lng=9.1919)
-    p2_dup = _place(None, name="Duomo", lat=45.4641, lng=9.1919)
+    invalid = {"id": "bad", "name": "Missing location"}
 
-    deduped = _worker._dedupe_places([p1, p1_dup, p2, p2_dup])
+    out = _worker._coerce_candidates([p1, p1_dup, invalid])
 
-    assert len(deduped) == 2
-    assert deduped[0]["id"] == "louvre"
-
-
-def test_coerce_place_result_uses_fallback_when_missing_candidates() -> None:
-    fallback = [_place("p1", name="Fallback")]
-    result = _worker._coerce_place_result({"foo": "bar"}, fallback)
-
-    assert "place_candidates" in result
-    assert len(result["place_candidates"]) == 1
-    assert result["place_candidates"][0]["id"] == "p1"
+    assert len(out) == 1
+    assert out[0].id == "louvre"
 
 
-def test_coerce_place_result_keeps_valid_candidates() -> None:
-    result = _worker._coerce_place_result(
-        {"place_candidates": [_place("a"), _place("a"), "bad"]},
-        fallback_candidates=[_place("fallback")],
+def test_normalize_search_args_uses_request_city_and_defaults() -> None:
+    normalized = _worker._normalize_search_places_args(
+        {
+            "query": "museums",
+            "city": "",
+            "radius_meters": None,
+            "place_type": "",
+        },
+        {"city": "Milan, Italy"},
     )
 
-    assert len(result["place_candidates"]) == 1
-    assert result["place_candidates"][0]["id"] == "a"
+    assert normalized["city"] == "Milan, Italy"
+    assert normalized["query"] == "museums"
+    assert normalized["radius_meters"] == 15_000
+    assert normalized["place_type"] is None
+
+
+def test_normalize_search_args_sanitizes_bad_radius() -> None:
+    normalized = _worker._normalize_search_places_args(
+        {
+            "query": "",
+            "city": "Paris",
+            "radius_meters": "bad",
+            "place_type": "museum",
+        },
+        {},
+    )
+
+    assert normalized["query"] == "top attractions in Paris"
+    assert normalized["radius_meters"] == 15_000
+    assert normalized["place_type"] == "museum"
 
 
 @pytest.mark.asyncio
-async def test_fallback_search_candidates_returns_data_when_search_works() -> None:
+async def test_fallback_returns_candidates_when_search_works() -> None:
     sample = [_place("p1", name="Duomo")]
     with patch.object(_worker, "search_places", new=AsyncMock(return_value=sample)):
-        rows = await _worker._fallback_search_candidates(
+        result = await _worker._fallback(
             {
                 "city": "Milan, Italy",
                 "preferences": ["art", "museums"],
             }
         )
 
-    assert len(rows) >= 1
-    assert rows[0]["id"] == "p1"
+    assert len(result["place_candidates"]) >= 1
+    assert result["place_candidates"][0]["id"] == "p1"
 
 
 @pytest.mark.asyncio
-async def test_fallback_search_candidates_handles_search_errors() -> None:
+async def test_fallback_handles_search_errors() -> None:
     with patch.object(
         _worker,
         "search_places",
         new=AsyncMock(side_effect=RuntimeError("api down")),
     ):
-        rows = await _worker._fallback_search_candidates(
+        result = await _worker._fallback(
             {
                 "city": "Milan, Italy",
                 "preferences": ["art", "museums"],
             }
         )
 
-    assert rows == []
+    assert result == {"place_candidates": []}

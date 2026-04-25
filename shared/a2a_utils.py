@@ -120,25 +120,13 @@ async def call_agent(
             len(artifacts),
         )
 
-        for artifact in task.get("artifacts", []):
-            for part in artifact.get("parts", []):
-                kind = part.get("kind")
-                if kind == "data":
-                    return part.get("data", {})
-                if kind == "text":
-                    text_payload = part.get("text", "")
-                    try:
-                        return json.loads(text_payload)
-                    except json.JSONDecodeError as exc:
-                        logger.exception(
-                            "A2A text artifact JSON decode failed: url=%s task_id=%s excerpt=%s",
-                            url,
-                            task_id,
-                            _short(text_payload),
-                        )
-                        raise RuntimeError(
-                            f"Agent task {task_id} returned non-JSON text artifact"
-                        ) from exc
+        payload = _extract_artifact_payload(
+            artifacts=artifacts,
+            task_id=task_id,
+            url=url,
+        )
+        if payload is not None:
+            return payload
 
         logger.error(
             "A2A task completed without artifacts: url=%s task_id=%s status=%s",
@@ -147,6 +135,59 @@ async def call_agent(
             task.get("status", {}),
         )
         raise RuntimeError("Agent completed but returned no artifacts")
+
+
+def _extract_artifact_payload(
+    artifacts: list[dict[str, Any]],
+    task_id: str,
+    url: str,
+) -> dict[str, Any] | None:
+    """Pick the most relevant artifact payload (prefer latest non-partial result)."""
+    partial_trace_payload: dict[str, Any] | None = None
+
+    for artifact in reversed(artifacts):
+        parts = artifact.get("parts", []) if isinstance(artifact, dict) else []
+        for part in reversed(parts):
+            if not isinstance(part, dict):
+                continue
+
+            kind = part.get("kind")
+            if kind == "data":
+                raw = part.get("data", {})
+                payload = raw if isinstance(raw, dict) else {"value": raw}
+                if _is_partial_trace_payload(payload):
+                    if partial_trace_payload is None:
+                        partial_trace_payload = payload
+                    continue
+                return payload
+
+            if kind == "text":
+                text_payload = part.get("text", "")
+                try:
+                    decoded = json.loads(text_payload)
+                except json.JSONDecodeError as exc:
+                    logger.exception(
+                        "A2A text artifact JSON decode failed: url=%s task_id=%s excerpt=%s",
+                        url,
+                        task_id,
+                        _short(text_payload),
+                    )
+                    raise RuntimeError(
+                        f"Agent task {task_id} returned non-JSON text artifact"
+                    ) from exc
+
+                payload = decoded if isinstance(decoded, dict) else {"value": decoded}
+                if _is_partial_trace_payload(payload):
+                    if partial_trace_payload is None:
+                        partial_trace_payload = payload
+                    continue
+                return payload
+
+    return partial_trace_payload
+
+
+def _is_partial_trace_payload(payload: dict[str, Any]) -> bool:
+    return isinstance(payload, dict) and set(payload.keys()) == {"partial_trace"}
 
 
 def _short(value: Any, max_len: int = 240) -> str:

@@ -5,6 +5,7 @@ The agent also calls Agent 4 (Food Recommender) via A2A.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Any
@@ -36,10 +37,11 @@ def order_places_by_proximity(
     places: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Greedily order places to minimise total walking distance (nearest-neighbour TSP)."""
-    if len(places) <= 1:
-        return list(places)
+    clean_places = _coerce_places(places)
+    if len(clean_places) <= 1:
+        return list(clean_places)
 
-    remaining = list(places)
+    remaining = list(clean_places)
     ordered = [remaining.pop(0)]
 
     while remaining:
@@ -55,6 +57,67 @@ def order_places_by_proximity(
         remaining.remove(nearest)
 
     return ordered
+
+
+def _coerce_places(raw: Any) -> list[dict[str, Any]]:
+    """Normalize potentially stringified/invalid tool input into place dicts."""
+    value = raw
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(value, dict):
+        nested = None
+        for key in ("places", "place_candidates", "clustered_place_candidates"):
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                nested = candidate
+                break
+        if nested is None:
+            return []
+        value = nested
+
+    if not isinstance(value, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                continue
+
+        if isinstance(item, list):
+            out.extend(_coerce_places(item))
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        loc = item.get("location")
+        if not isinstance(loc, dict):
+            continue
+
+        try:
+            lat = float(loc.get("latitude"))
+            lng = float(loc.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(lat) or not math.isfinite(lng):
+            continue
+
+        normalized = dict(item)
+        normalized_loc = dict(loc)
+        normalized_loc["latitude"] = lat
+        normalized_loc["longitude"] = lng
+        normalized["location"] = normalized_loc
+        out.append(normalized)
+
+    return out
 
 
 async def recommend_restaurant(

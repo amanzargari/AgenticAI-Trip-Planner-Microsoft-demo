@@ -29,7 +29,7 @@ async def geocode_city(city: str) -> dict[str, float]:
 async def search_places(
     query: str,
     city: str,
-    radius_meters: int = 15_000,
+    radius_meters: int | None = 15_000,
     place_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """Text-search for places of interest in *city* using the Google Places API."""
@@ -58,9 +58,17 @@ async def search_places(
         "language": "en",
         "key": key,
     }
+
+    try:
+        radius = int(radius_meters) if radius_meters is not None else 15_000
+    except (TypeError, ValueError):
+        radius = 15_000
+    if radius <= 0:
+        radius = 15_000
+
     if location:
         params["location"] = f"{location[0]},{location[1]}"
-        params["radius"] = radius_meters
+        params["radius"] = radius
     if place_type:
         params["type"] = place_type
 

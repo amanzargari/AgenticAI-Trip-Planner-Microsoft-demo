@@ -1,5 +1,6 @@
 """Tests for agent3 scheduling tools."""
 from __future__ import annotations
+import json
 import importlib.util, pathlib, sys, os
 from unittest.mock import AsyncMock, patch
 import pytest
@@ -44,6 +45,31 @@ def test_order_greedy():
     ordered = _tools.order_places_by_proximity([p1,p3,p2])
     ids = [p["id"] for p in ordered]
     assert ids==["p1","p2","p3"]
+
+def test_order_stringified_places():
+    p1, p2 = _p("p1", 48.860, 2.350), _p("p2", 48.861, 2.351)
+    payload = [json.dumps(p1), json.dumps(p2)]
+    ordered = _tools.order_places_by_proximity(payload)
+    assert [p["id"] for p in ordered] == ["p1", "p2"]
+
+def test_order_ignores_malformed_entries():
+    good = _p("ok", 48.860, 2.350)
+    bad_no_location = {"id": "bad1"}
+    bad_not_dict = "totally-not-json"
+    bad_non_finite = {
+        "id": "bad2",
+        "location": {"latitude": "nan", "longitude": 2.35, "address": ""},
+    }
+
+    ordered = _tools.order_places_by_proximity([good, bad_no_location, bad_not_dict, bad_non_finite])
+    assert len(ordered) == 1
+    assert ordered[0]["id"] == "ok"
+
+def test_order_accepts_nested_place_candidates_shape():
+    p1, p2 = _p("p1", 48.860, 2.350), _p("p2", 48.861, 2.351)
+    payload = {"place_candidates": [json.dumps([p1, p2])]}
+    ordered = _tools.order_places_by_proximity(payload)
+    assert [p["id"] for p in ordered] == ["p1", "p2"]
 
 @pytest.mark.asyncio
 async def test_recommend_restaurant_calls_agent4():

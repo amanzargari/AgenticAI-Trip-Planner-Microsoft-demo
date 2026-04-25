@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -15,6 +18,29 @@ from shared.models import PlaceCandidate
 from tools import TOOLS, geocode_city, search_places
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+AGENT1_MAX_TOOL_STEPS = _env_int("AGENT1_MAX_TOOL_STEPS", 8)
+AGENT1_MAX_TOOL_CALLS = _env_int("AGENT1_MAX_TOOL_CALLS", 12)
+AGENT1_MAX_SEARCH_CALLS = _env_int("AGENT1_MAX_SEARCH_CALLS", 6)
+AGENT1_TOOL_TIMEOUT_SEC = _env_float("AGENT1_TOOL_TIMEOUT_SEC", 20.0)
+AGENT1_TASK_BUDGET_SEC = _env_float("AGENT1_TASK_BUDGET_SEC", 90.0)
+AGENT1_MIN_CANDIDATES_EARLY_EXIT = _env_int("AGENT1_MIN_CANDIDATES_EARLY_EXIT", 12)
+AGENT1_FALLBACK_MAX_QUERIES = _env_int("AGENT1_FALLBACK_MAX_QUERIES", 4)
 
 
 # ── Structured output model ───────────────────────────────────────────────────
@@ -89,6 +115,11 @@ class PlaceRecommenderWorker(Worker[None]):
             llm = get_llm_client()
             collected: list[dict[str, Any]] = []
             tool_called = False
+            tool_calls_executed = 0
+            search_calls_executed = 0
+            seen_search_signatures: set[str] = set()
+            geocode_cache: dict[str, dict[str, float]] = {}
+            deadline = time.monotonic() + max(5.0, AGENT1_TASK_BUDGET_SEC)
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -96,12 +127,22 @@ class PlaceRecommenderWorker(Worker[None]):
             ]
 
             # Phase 1: tool calls — no response_format (Gemini rejects tool_choice=required + response_format together)
-            for _ in range(12):
+            stop_phase_1 = False
+            for step in range(max(1, AGENT1_MAX_TOOL_STEPS)):
+                if time.monotonic() >= deadline:
+                    logger.warning("PlaceRecommender phase-1 deadline reached task_id=%s step=%d", task_id, step + 1)
+                    break
+
+                request_timeout = min(
+                    max(5.0, deadline - time.monotonic()),
+                    max(5.0, AGENT1_TOOL_TIMEOUT_SEC),
+                )
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto" if tool_called else "required",
+                    timeout=request_timeout,
                 )
                 choice = response.choices[0]
 
@@ -121,7 +162,17 @@ class PlaceRecommenderWorker(Worker[None]):
                         ],
                     })
                     for tc in tool_calls:
+                        if tool_calls_executed >= max(1, AGENT1_MAX_TOOL_CALLS):
+                            stop_phase_1 = True
+                            break
+
+                        if time.monotonic() >= deadline:
+                            stop_phase_1 = True
+                            break
+
                         name = tc.function.name
+                        tool_calls_executed += 1
+
                         try:
                             args = json.loads(tc.function.arguments)
                         except json.JSONDecodeError as exc:
@@ -129,9 +180,36 @@ class PlaceRecommenderWorker(Worker[None]):
                         else:
                             try:
                                 if name == "search_places":
-                                    tool_result = await search_places(**args)
+                                    normalized = _normalize_search_places_args(args, data)
+                                    if not normalized["city"]:
+                                        tool_result = {"error": "search_places failed: city is required"}
+                                    else:
+                                        sig = _search_signature(normalized)
+                                        if sig in seen_search_signatures:
+                                            tool_result = []
+                                        elif search_calls_executed >= max(1, AGENT1_MAX_SEARCH_CALLS):
+                                            tool_result = []
+                                        else:
+                                            seen_search_signatures.add(sig)
+                                            search_calls_executed += 1
+                                            tool_result = await asyncio.wait_for(
+                                                search_places(**normalized),
+                                                timeout=max(3.0, AGENT1_TOOL_TIMEOUT_SEC),
+                                            )
                                 elif name == "geocode_city":
-                                    tool_result = await geocode_city(**args)
+                                    normalized_geo = _normalize_geocode_args(args, data)
+                                    city = normalized_geo["city"]
+                                    if not city:
+                                        tool_result = {"error": "geocode_city failed: city is required"}
+                                    elif city in geocode_cache:
+                                        tool_result = geocode_cache[city]
+                                    else:
+                                        geo = await asyncio.wait_for(
+                                            geocode_city(**normalized_geo),
+                                            timeout=max(3.0, AGENT1_TOOL_TIMEOUT_SEC),
+                                        )
+                                        geocode_cache[city] = geo
+                                        tool_result = geo
                                 else:
                                     tool_result = {"error": f"Unknown tool: {name}"}
                             except Exception as exc:
@@ -145,29 +223,45 @@ class PlaceRecommenderWorker(Worker[None]):
                             "content": json.dumps(tool_result),
                             "tool_call_id": tc.id,
                         })
+
+                    if stop_phase_1:
+                        break
+
+                    if len(_coerce_candidates(collected)) >= max(1, AGENT1_MIN_CANDIDATES_EARLY_EXIT):
+                        break
                 else:
                     break
 
             # Phase 2: structured output — no tools so response_format works without conflict
+            collected_candidates = _coerce_candidates(collected)
+            if collected_candidates:
+                result_dict = PlaceOutput(place_candidates=collected_candidates).model_dump(mode="json")
+            elif time.monotonic() >= deadline:
+                logger.warning("PlaceRecommender deadline reached before phase-2 parse task_id=%s", task_id)
+                result_dict = await _fallback(data)
             try:
-                final = await llm.beta.chat.completions.parse(
-                    model=DEFAULT_MODEL,
-                    messages=messages,
-                    response_format=PlaceOutput,
-                )
-                parsed: Optional[PlaceOutput] = final.choices[0].message.parsed
-                if parsed and parsed.place_candidates:
-                    result_dict = parsed.model_dump(mode="json")
-                elif collected:
-                    result_dict = PlaceOutput(place_candidates=_coerce_candidates(collected)).model_dump(mode="json")
-                else:
-                    result_dict = await _fallback(data)
+                if not collected_candidates and time.monotonic() < deadline:
+                    parse_timeout = min(
+                        max(5.0, deadline - time.monotonic()),
+                        max(5.0, AGENT1_TOOL_TIMEOUT_SEC),
+                    )
+                    final = await asyncio.wait_for(
+                        llm.beta.chat.completions.parse(
+                            model=DEFAULT_MODEL,
+                            messages=messages,
+                            response_format=PlaceOutput,
+                            timeout=parse_timeout,
+                        ),
+                        timeout=parse_timeout + 1.0,
+                    )
+                    parsed: Optional[PlaceOutput] = final.choices[0].message.parsed
+                    if parsed and parsed.place_candidates:
+                        result_dict = parsed.model_dump(mode="json")
+                    else:
+                        result_dict = await _fallback(data)
             except Exception:
                 logger.exception("PlaceRecommender phase-2 parse failed task_id=%s", task_id)
-                result_dict = (
-                    PlaceOutput(place_candidates=_coerce_candidates(collected)).model_dump(mode="json")
-                    if collected else await _fallback(data)
-                )
+                result_dict = PlaceOutput(place_candidates=collected_candidates).model_dump(mode="json") if collected_candidates else await _fallback(data)
             await self.storage.update_task(
                 task_id,
                 state="completed",
@@ -208,11 +302,57 @@ async def _fallback(data: dict[str, Any]) -> dict[str, Any]:
     queries = [f"top attractions in {city}", f"things to do in {city}"]
     queries += [f"{p} in {city}" for p in prefs if str(p).strip()]
     gathered: list[dict[str, Any]] = []
-    for q in queries[:6]:
+    for q in queries[: max(1, AGENT1_FALLBACK_MAX_QUERIES)]:
         try:
-            rows = await search_places(query=q, city=city)
+            rows = await asyncio.wait_for(
+                search_places(query=q, city=city, radius_meters=15_000, place_type=None),
+                timeout=max(3.0, AGENT1_TOOL_TIMEOUT_SEC),
+            )
             if isinstance(rows, list):
                 gathered.extend(p for p in rows if isinstance(p, dict))
         except Exception:
             pass
     return PlaceOutput(place_candidates=_coerce_candidates(gathered)).model_dump(mode="json")
+
+
+def _normalize_search_places_args(args: dict[str, Any], request_data: dict[str, Any]) -> dict[str, Any]:
+    city = str(args.get("city") or request_data.get("city") or "").strip()
+    query = str(args.get("query") or "").strip()
+    if not query:
+        query = f"top attractions in {city}" if city else "top attractions"
+
+    radius_meters = args.get("radius_meters")
+    try:
+        radius = int(radius_meters) if radius_meters is not None else 15_000
+    except (TypeError, ValueError):
+        radius = 15_000
+    if radius <= 0:
+        radius = 15_000
+
+    place_type = args.get("place_type")
+    place_type = str(place_type).strip() if place_type is not None else None
+    if not place_type:
+        place_type = None
+
+    return {
+        "query": query,
+        "city": city,
+        "radius_meters": radius,
+        "place_type": place_type,
+    }
+
+
+def _normalize_geocode_args(args: dict[str, Any], request_data: dict[str, Any]) -> dict[str, str]:
+    city = str(args.get("city") or request_data.get("city") or "").strip()
+    return {"city": city}
+
+
+def _search_signature(normalized_args: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(normalized_args.get("city") or "").strip().lower(),
+            str(normalized_args.get("query") or "").strip().lower(),
+            str(normalized_args.get("radius_meters") or ""),
+            str(normalized_args.get("place_type") or "").strip().lower(),
+        ]
+    )
