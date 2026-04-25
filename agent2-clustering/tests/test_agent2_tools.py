@@ -43,6 +43,18 @@ def test_geographic_coherence():
     lats = [sum(p["location"]["latitude"] for p in x)/len(x) for x in c]
     assert abs(lats[0]-lats[1])>0.01
 
+def test_identical_coordinates_do_not_crash():
+    same = [_p(f"x{i}", 48.8566, 2.3522) for i in range(4)]
+    c = _tools.cluster_places(same, 2)
+    assert len(c) == 2 and sum(len(x) for x in c) == 4
+
+def test_non_positive_num_clusters_is_sanitized():
+    two = [_p("a", 48.86, 2.33), _p("b", 48.84, 2.35)]
+    c0 = _tools.cluster_places(two, 0)
+    cneg = _tools.cluster_places(two, -3)
+    assert len(c0) == 1 and sum(len(x) for x in c0) == 2
+    assert len(cneg) == 1 and sum(len(x) for x in cneg) == 2
+
 def test_num_days_three():
     assert _tools.num_days_from_dates("2026-06-01T09:00:00","2026-06-04T09:00:00")==3
 

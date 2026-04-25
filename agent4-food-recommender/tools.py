@@ -142,12 +142,14 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_restaurants",
+            "strict": True,
             "description": (
                 "Search for restaurants near a location using Google Places Nearby Search. "
                 "Call multiple times with different meal_slot or cuisine_type to find diverse options."
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "latitude": {
                         "type": "number",
@@ -158,32 +160,32 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "Longitude of the search center.",
                     },
                     "radius_meters": {
-                        "type": "integer",
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
                         "description": "Search radius in metres (default 500).",
-                        "default": 500,
                     },
                     "meal_slot": {
-                        "type": "string",
-                        "enum": ["breakfast", "lunch", "dinner"],
+                        "anyOf": [
+                            {"type": "string", "enum": ["breakfast", "lunch", "dinner"]},
+                            {"type": "null"},
+                        ],
                         "description": "Meal slot being searched — sets default keyword (breakfast/lunch/dinner).",
-                        "default": "lunch",
                     },
                     "budget_per_person": {
-                        "type": "number",
+                        "anyOf": [{"type": "number"}, {"type": "null"}],
                         "description": (
                             "Per-person budget in EUR. Automatically maps to a price level: "
                             "≤€15→cheap (1), ≤€35→moderate (2), ≤€70→expensive (3)."
                         ),
                     },
                     "cuisine_type": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": (
                             "Optional cuisine keyword overriding the slot default, "
                             "e.g. 'Italian', 'Japanese', 'vegan', 'vegetarian'."
                         ),
                     },
                 },
-                "required": ["latitude", "longitude"],
+                "required": ["latitude", "longitude", "radius_meters", "meal_slot", "budget_per_person", "cuisine_type"],
             },
         },
     }

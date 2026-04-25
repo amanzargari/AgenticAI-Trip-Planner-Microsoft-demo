@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Any
 
 from fasta2a.schema import Artifact, Message, TaskIdParams, TaskSendParams
@@ -15,28 +12,28 @@ from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, cluster_places, recommend_places, schedule_day
 
-
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
-You are the Trip Planner Orchestrator — a conversational AI that helps users plan and refine travel itineraries.
 
-You handle two types of requests:
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are the Trip Planner Orchestrator — a conversational AI that plans and refines travel itineraries.
+
+You handle two request types:
 
 ━━━ TYPE 1: INITIAL PLANNING ━━━
 Input has: city, trip_start, trip_end, budget, trip_reason, preferences.
-→ Call recommend_places → cluster_places → schedule_day (once per day).
-→ Produce a complete itinerary from scratch.
+→ Call recommend_places → cluster_places → schedule_day (once per cluster/day).
+→ After all schedule_day calls complete, output the trip metadata.
 
 ━━━ TYPE 2: MODIFICATION ━━━
 Input has: modification_request (string), current_itinerary (existing plan), plus original trip fields.
-→ Understand what the user wants to change:
-   • New activities / different vibe → call recommend_places (with updated preferences), then cluster_places, then schedule_day.
-   • Restaurants / food change only → call schedule_day again for the affected day(s) with updated preferences.
-   • Minor preference tweak within existing places → call schedule_day for affected days.
-   • Structural date/budget change → treat as a full re-plan (all three tools).
-→ Be smart: preserve unchanged days from current_itinerary whenever possible.
-→ Use the modification_request to understand intent (e.g. "more outdoor", "vegetarian food", "add a museum").
+→ Decide which tools to re-run based on what the user wants to change:
+   • New activities / different vibe → recommend_places, cluster_places, then schedule_day for each day.
+   • Restaurants / food change only → schedule_day again for affected days with updated preferences.
+   • Minor tweak within existing places → schedule_day for affected days.
+→ After all needed tool calls complete, output the trip metadata.
 
 Budget policy when budget is provided:
 - activity_budget = 0.70 * total_budget
@@ -48,7 +45,7 @@ Available tools:
 1) recommend_places(city, trip_start, trip_end, activity_budget, trip_reason, preferences)
      → {"place_candidates": [...]}
 2) cluster_places(trip_start, trip_end, place_candidates)
-     → {"clustered_place_candidates": [[...], [...], ...]}
+     → {"clustered_place_candidates": [[...], ...]}
 3) schedule_day(places, day_start, day_end, food_budget_per_day, preferences)
      → {"date": "YYYY-MM-DD", "events": [...]}
 
@@ -56,26 +53,24 @@ Execution rules:
 - Always call recommend_places before cluster_places; cluster_places before schedule_day.
 - day_start = 09:00 on each date; day_end = 21:00 on each date.
 - Never hallucinate tool results; only use actual tool outputs.
-- For modifications, you MAY skip recommend_places/cluster_places if the existing places still work.
-- If a tool returns {"error": ...} or {"date": ..., "events": []}, do NOT retry it. Accept the result and continue.
-- After all schedule_day calls complete (even if some returned errors/empty), output the final JSON immediately.
+- If a tool returns {"error": ...} or {"events": []}, do NOT retry it — accept and move on.
+- After all schedule_day calls finish (even if some returned errors), output the metadata immediately.
 
-Output (STRICT — no markdown, no prose, no backticks):
+Final output — ONLY these four fields (schedules are assembled automatically from tool results):
 {
     "city": "...",
-    "trip_start": "ISO",
-    "trip_end": "ISO",
-    "total_budget": float | null,
-    "schedules": [
-        {
-            "date": "YYYY-MM-DD",
-            "events": [...]
-        }
-    ]
+    "trip_start": "ISO datetime",
+    "trip_end": "ISO datetime",
+    "total_budget": float or null
 }
-- Always return this exact shape, even on partial/empty data.
-- Set "schedules" to [] only if nothing could be scheduled.
 """
+
+
+_AGENT_LABELS: dict[str, str] = {
+    "recommend_places": "Place Recommender",
+    "cluster_places":   "Clustering",
+    "schedule_day":     "Daily Scheduler",
+}
 
 
 @dataclass
@@ -108,75 +103,77 @@ class OrchestratorWorker(Worker[None]):
 
         try:
             data = extract_message_data(params["message"])
-            logger.info(
-                "Orchestrator task started task_id=%s payload_keys=%s",
-                task_id,
-                sorted(data.keys()),
-            )
+            logger.info("Orchestrator started task_id=%s keys=%s", task_id, sorted(data.keys()))
             llm = get_llm_client()
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(data)},
             ]
-            fallback_schedules: list[dict[str, Any]] = []
+
+            # Schedules collected from schedule_day tool results (source of truth)
+            collected_schedules: list[dict[str, Any]] = []
             trace_events: list[dict[str, Any]] = []
             schedule_day_failures: dict[str, int] = {}
 
+            is_initial = "modification_request" not in data
+            called_tools: set[str] = set()
+
             for step in range(40):
+                # Force tool calls to prevent the LLM from skipping the planning pipeline.
+                # With tool_choice="auto" + response_format, models tend to skip tools entirely.
+                if is_initial:
+                    if "recommend_places" not in called_tools:
+                        tool_choice: Any = {"type": "function", "function": {"name": "recommend_places"}}
+                    elif "cluster_places" not in called_tools:
+                        tool_choice = {"type": "function", "function": {"name": "cluster_places"}}
+                    elif not collected_schedules:
+                        tool_choice = "required"
+                    else:
+                        tool_choice = "auto"
+                else:
+                    tool_choice = "required" if step == 0 else "auto"
+
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                 )
                 choice = response.choices[0]
-                logger.info(
-                    "Orchestrator LLM step task_id=%s step=%d finish_reason=%s",
-                    task_id, step + 1, choice.finish_reason,
-                )
+                logger.info("Orchestrator step=%d finish=%s tc=%s task_id=%s", step + 1, choice.finish_reason, tool_choice, task_id)
 
                 if choice.finish_reason == "tool_calls":
                     tool_calls = choice.message.tool_calls or []
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": choice.message.content,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments,
-                                    },
-                                }
-                                for tc in tool_calls
-                            ],
-                        }
-                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                            }
+                            for tc in tool_calls
+                        ],
+                    })
+
                     for tc in tool_calls:
                         name = tc.function.name
                         try:
                             args = json.loads(tc.function.arguments)
                         except json.JSONDecodeError as exc:
-                            logger.exception(
-                                "Orchestrator tool arguments JSON decode failed task_id=%s tool=%s",
-                                task_id, name,
-                            )
-                            tool_result = {"error": f"Invalid arguments for tool {name}: {exc}"}
+                            tool_result: Any = {"error": f"Invalid arguments for {name}: {exc}"}
                             messages.append({
                                 "role": "tool",
                                 "content": json.dumps(tool_result),
                                 "tool_call_id": tc.id,
                             })
-                            trace_events.append(_make_trace_event(name, {}, tool_result, "error"))
+                            trace_events.append(_trace(name, {}, tool_result, "error"))
                             continue
 
-                        logger.info(
-                            "Orchestrator tool call task_id=%s tool=%s arg_keys=%s",
-                            task_id, name, sorted(args.keys()),
-                        )
+                        logger.info("Orchestrator tool=%s arg_keys=%s task_id=%s", name, sorted(args.keys()), task_id)
+                        called_tools.add(name)
 
                         skipped = False
                         try:
@@ -187,10 +184,7 @@ class OrchestratorWorker(Worker[None]):
                             elif name == "schedule_day":
                                 day_key = str(args.get("day_start", ""))[:10]
                                 if schedule_day_failures.get(day_key, 0) >= 2:
-                                    logger.warning(
-                                        "Orchestrator skipping schedule_day retry task_id=%s day=%s",
-                                        task_id, day_key,
-                                    )
+                                    logger.warning("Orchestrator skipping retry for day=%s task_id=%s", day_key, task_id)
                                     tool_result = {"date": day_key, "events": []}
                                     skipped = True
                                 else:
@@ -198,56 +192,50 @@ class OrchestratorWorker(Worker[None]):
                             else:
                                 tool_result = {"error": f"Unknown tool: {name}"}
                         except Exception as exc:
-                            logger.exception(
-                                "Orchestrator tool execution failed task_id=%s tool=%s",
-                                task_id, name,
-                            )
+                            logger.exception("Orchestrator tool=%s failed task_id=%s", name, task_id)
                             tool_result = {"error": str(exc)}
 
                         is_error = isinstance(tool_result, dict) and bool(tool_result.get("error"))
                         if is_error:
-                            logger.warning(
-                                "Orchestrator tool returned error task_id=%s tool=%s error=%s",
-                                task_id, name, tool_result.get("error"),
-                            )
                             if name == "schedule_day":
                                 day_key = str(args.get("day_start", ""))[:10]
                                 schedule_day_failures[day_key] = schedule_day_failures.get(day_key, 0) + 1
-                        else:
-                            logger.info(
-                                "Orchestrator tool succeeded task_id=%s tool=%s",
-                                task_id, name,
-                            )
-                            if name == "schedule_day" and isinstance(tool_result, dict):
-                                fallback_schedules.append(tool_result)
+                                logger.warning("schedule_day error day=%s failures=%d task_id=%s",
+                                               day_key, schedule_day_failures[day_key], task_id)
+                        elif name == "schedule_day" and isinstance(tool_result, dict):
+                            collected_schedules.append(tool_result)
 
                         status = "skipped" if skipped else ("error" if is_error else "success")
-                        trace_events.append(_make_trace_event(name, args, tool_result, status))
+                        trace_events.append(_trace(name, args, tool_result, status))
+
+                        # Push intermediate trace so the UI can poll for real-time updates
+                        try:
+                            await self.storage.update_task(
+                                task_id,
+                                state="working",
+                                new_artifacts=[make_data_artifact({"partial_trace": trace_events})],
+                            )
+                        except Exception:
+                            pass
 
                         messages.append({
                             "role": "tool",
                             "content": json.dumps(tool_result),
                             "tool_call_id": tc.id,
                         })
+
                 else:
-                    raw = choice.message.content or "{}"
-                    parsed = _parse_json(raw)
-                    result = _normalize_orchestrator_result(
-                        parsed,
-                        request_data=data,
-                        fallback_schedules=fallback_schedules,
-                        trace_events=trace_events,
-                    )
-                    if isinstance(parsed, dict) and parsed.get("error"):
-                        logger.warning(
-                            "Orchestrator produced error-shaped result task_id=%s error=%s",
-                            task_id, parsed.get("error"),
-                        )
+                    # LLM stopped — metadata always comes from the request, not LLM text.
+                    meta = _meta_from_request(data)
+
+                    # Schedules come from tool results, not from the LLM output.
+                    # For modifications: if no new tool calls were made, preserve existing schedules.
+                    schedules = collected_schedules or _existing_schedules(data)
+
+                    result = {**meta, "schedules": schedules, "trace": trace_events}
                     logger.info(
-                        "Orchestrator task completed task_id=%s schedules=%d trace_steps=%d",
-                        task_id,
-                        len(result.get("schedules", [])),
-                        len(trace_events),
+                        "Orchestrator completed task_id=%s schedules=%d trace=%d",
+                        task_id, len(schedules), len(trace_events),
                     )
                     await self.storage.update_task(
                         task_id,
@@ -256,64 +244,25 @@ class OrchestratorWorker(Worker[None]):
                     )
                     return
 
-            logger.error("Orchestrator task exceeded max iterations task_id=%s", task_id)
-            fallback_result = _normalize_orchestrator_result(
-                {},
-                request_data=data,
-                fallback_schedules=fallback_schedules,
-                trace_events=trace_events,
-            )
+            # Exceeded max iterations — use what we have
+            logger.error("Orchestrator exceeded iterations task_id=%s", task_id)
+            meta = _meta_from_request(data)
+            schedules = collected_schedules or _existing_schedules(data)
             await self.storage.update_task(
                 task_id,
                 state="completed",
-                new_artifacts=self.build_artifacts(fallback_result),
+                new_artifacts=self.build_artifacts({**meta, "schedules": schedules, "trace": trace_events}),
             )
-            return
 
         except Exception:
-            logger.exception("Orchestrator task crashed task_id=%s", task_id)
+            logger.exception("Orchestrator crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
 
 
-def _parse_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    # Strip markdown code blocks
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        text = match.group(1).strip()
-    # Try direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Strip any text prefix before the first '{' (e.g. "final_response:{...}")
-    brace = text.find("{")
-    if brace > 0:
-        try:
-            return json.loads(text[brace:])
-        except json.JSONDecodeError:
-            pass
-    logger.warning(
-        "Orchestrator final response was not valid JSON; excerpt=%s",
-        text[:240],
-    )
-    return {"error": "Could not parse orchestrator output", "raw": text}
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-
-_AGENT_LABELS: dict[str, str] = {
-    "recommend_places": "Place Recommender",
-    "cluster_places":   "Clustering",
-    "schedule_day":     "Daily Scheduler",
-}
-
-
-def _make_trace_event(
-    tool: str,
-    args: dict[str, Any],
-    result: Any,
-    status: str,
-) -> dict[str, Any]:
+def _trace(tool: str, args: dict, result: Any, status: str) -> dict[str, Any]:
     return {
         "tool":   tool,
         "agent":  _AGENT_LABELS.get(tool, tool),
@@ -323,53 +272,27 @@ def _make_trace_event(
     }
 
 
-def _normalize_orchestrator_result(
-    result: Any,
-    request_data: dict[str, Any],
-    fallback_schedules: list[dict[str, Any]],
-    trace_events: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    src = result if isinstance(result, dict) else {}
-
-    fallback_city = str(request_data.get("city") or "")
-    fallback_trip_start = str(request_data.get("trip_start") or "")
-    fallback_trip_end = str(request_data.get("trip_end") or "")
-    fallback_total_budget = _extract_total_budget(request_data)
-
-    schedules = src.get("schedules")
-    if isinstance(schedules, list):
-        valid_schedules = [s for s in schedules if isinstance(s, dict)]
-        schedules = valid_schedules or [s for s in fallback_schedules if isinstance(s, dict)]
-    else:
-        schedules = [s for s in fallback_schedules if isinstance(s, dict)]
-
-    total_budget = src.get("total_budget")
-    if total_budget is None:
-        total_budget = fallback_total_budget
-    elif not isinstance(total_budget, (int, float)):
+def _meta_from_request(data: dict[str, Any]) -> dict[str, Any]:
+    budget = data.get("budget")
+    total = None
+    if isinstance(budget, dict):
         try:
-            total_budget = float(total_budget)
+            total = float(budget.get("total_budget", 0) or 0) or None
         except (TypeError, ValueError):
-            total_budget = fallback_total_budget
-
+            total = None
     return {
-        "city":        str(src.get("city") or fallback_city),
-        "trip_start":  str(src.get("trip_start") or fallback_trip_start),
-        "trip_end":    str(src.get("trip_end") or fallback_trip_end),
-        "total_budget": total_budget,
-        "schedules":   schedules,
-        "trace":       trace_events or [],
+        "city":         str(data.get("city") or ""),
+        "trip_start":   str(data.get("trip_start") or ""),
+        "trip_end":     str(data.get("trip_end") or ""),
+        "total_budget": total,
     }
 
 
-def _extract_total_budget(request_data: dict[str, Any]) -> float | None:
-    budget = request_data.get("budget")
-    if isinstance(budget, dict):
-        value = budget.get("total_budget")
-        if isinstance(value, (int, float)):
-            return float(value)
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-    return None
+def _existing_schedules(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return schedules from current_itinerary when in modification mode."""
+    itin = data.get("current_itinerary")
+    if isinstance(itin, dict):
+        schedules = itin.get("schedules")
+        if isinstance(schedules, list):
+            return [s for s in schedules if isinstance(s, dict)]
+    return []

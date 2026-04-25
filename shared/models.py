@@ -1,9 +1,27 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+
+def _coerce_float(v: Any) -> Optional[float]:
+    """Convert strings like '€20', 'Free', 'Varies' to float or None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        cleaned = re.sub(r"[^\d.]", "", v)
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
 
 
 class Location(BaseModel):
@@ -27,6 +45,11 @@ class PlaceCandidate(BaseModel):
     rating: Optional[float] = None
     summary: Optional[str] = None
 
+    @field_validator("estimated_cost", "rating", mode="before")
+    @classmethod
+    def coerce_numeric(cls, v: Any) -> Optional[float]:
+        return _coerce_float(v)
+
 
 class RestaurantCandidate(BaseModel):
     id: str
@@ -36,6 +59,11 @@ class RestaurantCandidate(BaseModel):
     cuisines: Optional[list[str]] = None
     rating: Optional[float] = None
     summary: Optional[str] = None
+
+    @field_validator("price_level", "rating", mode="before")
+    @classmethod
+    def coerce_numeric(cls, v: Any) -> Optional[float]:
+        return _coerce_float(v)
 
 
 class VisitEvent(BaseModel):

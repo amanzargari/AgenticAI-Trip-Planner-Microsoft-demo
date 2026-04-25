@@ -135,6 +135,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_places",
+            "strict": True,
             "description": (
                 "Search for tourist attractions, landmarks, and points of interest "
                 "in a city using Google Places Text Search. "
@@ -142,6 +143,7 @@ TOOLS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "query": {
                         "type": "string",
@@ -155,19 +157,18 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "City name used as a location bias for the search.",
                     },
                     "radius_meters": {
-                        "type": "integer",
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
                         "description": "Search radius in metres around city centre (default 15000).",
-                        "default": 15000,
                     },
                     "place_type": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": (
                             "Optional Google Places type filter, e.g. "
                             "'museum', 'park', 'tourist_attraction'."
                         ),
                     },
                 },
-                "required": ["query", "city"],
+                "required": ["query", "city", "radius_meters", "place_type"],
             },
         },
     },
@@ -175,9 +176,11 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "geocode_city",
+            "strict": True,
             "description": "Return the latitude and longitude of a city centre.",
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "city": {"type": "string", "description": "City name to geocode."}
                 },

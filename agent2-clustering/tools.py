@@ -4,7 +4,6 @@ Uses a pure-numpy K-means so no heavy ML dependencies are needed.
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
@@ -23,50 +22,117 @@ def cluster_places(
         return []
 
     n = len(places)
-    k = min(num_clusters, n)
+    try:
+        requested = int(num_clusters)
+    except (TypeError, ValueError):
+        requested = 1
+    k = max(1, min(requested, n))
 
     if k == 1:
         return [list(places)]
 
-    coords = np.array(
-        [[p["location"]["latitude"], p["location"]["longitude"]] for p in places],
-        dtype=float,
-    )
+    coords = _extract_coords(places)
+    if coords is None:
+        return _round_robin_clusters(places, k)
 
-    # K-means++ initialisation for better convergence
+    # If coordinates are degenerate (e.g., all points identical), geo clustering
+    # cannot separate places meaningfully. Spread items round-robin across days.
+    unique_coord_count = len(np.unique(coords, axis=0))
+    if unique_coord_count < k:
+        return _round_robin_clusters(places, k)
+
+    centers = _init_kmeans_pp(coords, k)
+
+    try:
+        for _ in range(100):
+            # Assignment step
+            dist_matrix = np.stack(
+                [_haversine_all(coords, c) for c in centers], axis=1
+            )
+            assignments = np.argmin(dist_matrix, axis=1)
+
+            # Update step
+            new_centers = np.zeros_like(centers)
+            for ci in range(k):
+                members = coords[assignments == ci]
+                new_centers[ci] = members.mean(axis=0) if len(members) else centers[ci]
+
+            if np.allclose(centers, new_centers, atol=1e-8):
+                break
+            centers = new_centers
+
+        clusters: list[list[dict[str, Any]]] = [[] for _ in range(k)]
+        for i, place in enumerate(places):
+            clusters[assignments[i]].append(place)
+
+        result = [c for c in clusters if c]
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # Fallback: round-robin when k-means fails (e.g. degenerate coordinates)
+    return _round_robin_clusters(places, k)
+
+
+def _round_robin_clusters(
+    places: list[dict[str, Any]],
+    k: int,
+) -> list[list[dict[str, Any]]]:
+    k = max(1, int(k))
+    buckets: list[list[dict[str, Any]]] = [[] for _ in range(k)]
+    for i, place in enumerate(places):
+        buckets[i % k].append(place)
+    return [b for b in buckets if b]
+
+
+def _extract_coords(places: list[dict[str, Any]]) -> np.ndarray | None:
+    rows: list[list[float]] = []
+    for place in places:
+        location = place.get("location") if isinstance(place, dict) else None
+        if not isinstance(location, dict):
+            return None
+
+        try:
+            lat = float(location.get("latitude"))
+            lng = float(location.get("longitude"))
+        except (TypeError, ValueError):
+            return None
+
+        if not np.isfinite(lat) or not np.isfinite(lng):
+            return None
+
+        rows.append([lat, lng])
+
+    if not rows:
+        return None
+    return np.array(rows, dtype=float)
+
+
+def _init_kmeans_pp(coords: np.ndarray, k: int) -> np.ndarray:
+    """K-means++ initialisation with safeguards for zero-distance datasets."""
+    n = len(coords)
     rng = np.random.default_rng(seed=42)
     center_idx = [int(rng.integers(n))]
+
     for _ in range(k - 1):
-        dists = np.min(
-            [_haversine_all(coords, coords[ci]) for ci in center_idx], axis=0
-        )
-        probs = dists / dists.sum()
+        dists = np.min([_haversine_all(coords, coords[ci]) for ci in center_idx], axis=0)
+        total = float(np.sum(dists))
+
+        if not np.isfinite(total) or total <= 0:
+            remaining = [i for i in range(n) if i not in center_idx]
+            center_idx.append(int(rng.choice(remaining)))
+            continue
+
+        probs = dists / total
+        if not np.all(np.isfinite(probs)):
+            remaining = [i for i in range(n) if i not in center_idx]
+            center_idx.append(int(rng.choice(remaining)))
+            continue
+
         center_idx.append(int(rng.choice(n, p=probs)))
 
-    centers = coords[center_idx]
-
-    for _ in range(100):
-        # Assignment step
-        dist_matrix = np.stack(
-            [_haversine_all(coords, c) for c in centers], axis=1
-        )
-        assignments = np.argmin(dist_matrix, axis=1)
-
-        # Update step
-        new_centers = np.zeros_like(centers)
-        for ci in range(k):
-            members = coords[assignments == ci]
-            new_centers[ci] = members.mean(axis=0) if len(members) else centers[ci]
-
-        if np.allclose(centers, new_centers, atol=1e-8):
-            break
-        centers = new_centers
-
-    clusters: list[list[dict[str, Any]]] = [[] for _ in range(k)]
-    for i, place in enumerate(places):
-        clusters[assignments[i]].append(place)
-
-    return [c for c in clusters if c]
+    return coords[center_idx]
 
 
 def _haversine_all(coords: np.ndarray, center: np.ndarray) -> np.ndarray:

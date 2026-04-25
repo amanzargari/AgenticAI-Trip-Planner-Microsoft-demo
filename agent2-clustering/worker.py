@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,9 @@ from fasta2a.worker import Worker
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
 from tools import TOOLS, cluster_places, num_days_from_dates
+
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are the Clustering Agent.
@@ -68,27 +72,36 @@ class ClusteringWorker(Worker[None]):
         task_id = params["id"]
         await self.storage.update_task(task_id, state="working")
 
+        data: dict[str, Any] = {}
         try:
             data = extract_message_data(params["message"])
 
-            # Fast path: compute directly without LLM if data is well-structured
-            if (
-                "place_candidates" in data
-                and "trip_start" in data
-                and "trip_end" in data
-            ):
+            # Deterministic fast path for orchestrator payloads.
+            # This avoids unnecessary LLM/tool loops and prevents agent failures
+            # from bubbling up when clustering input is degenerate.
+            places = data.get("place_candidates")
+            if isinstance(places, list):
                 try:
-                    n_days = num_days_from_dates(data["trip_start"], data["trip_end"])
-                    clusters = cluster_places(data["place_candidates"], n_days)
-                    result = {"clustered_place_candidates": clusters}
-                    await self.storage.update_task(
-                        task_id,
-                        state="completed",
-                        new_artifacts=self.build_artifacts(result),
+                    n_days = num_days_from_dates(
+                        str(data.get("trip_start") or ""),
+                        str(data.get("trip_end") or ""),
                     )
-                    return
                 except Exception:
-                    pass  # fall through to LLM path
+                    n_days = 1
+
+                try:
+                    clusters = cluster_places(places, n_days)
+                except Exception:
+                    logger.exception("Clustering fast-path crashed task_id=%s", task_id)
+                    clusters = [places] if places else []
+
+                result = {"clustered_place_candidates": clusters}
+                await self.storage.update_task(
+                    task_id,
+                    state="completed",
+                    new_artifacts=self.build_artifacts(result),
+                )
+                return
 
             # LLM path for edge cases / natural-language input
             llm = get_llm_client()
@@ -97,16 +110,18 @@ class ClusteringWorker(Worker[None]):
                 {"role": "user", "content": json.dumps(data)},
             ]
 
+            tool_called_2 = False
             for _ in range(6):
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice="auto" if tool_called_2 else "required",
                 )
                 choice = response.choices[0]
 
                 if choice.finish_reason == "tool_calls":
+                    tool_called_2 = True
                     tool_calls = choice.message.tool_calls or []
                     messages.append(
                         {
@@ -126,11 +141,19 @@ class ClusteringWorker(Worker[None]):
                         }
                     )
                     for tc in tool_calls:
-                        args = json.loads(tc.function.arguments)
-                        if tc.function.name == "cluster_places":
-                            tool_result = cluster_places(**args)
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            tool_result = {"error": f"Invalid arguments: {exc}"}
                         else:
-                            tool_result = {"error": f"Unknown tool: {tc.function.name}"}
+                            if tc.function.name == "cluster_places":
+                                try:
+                                    tool_result = cluster_places(**args)
+                                except Exception as exc:
+                                    logger.exception("LLM tool cluster_places failed task_id=%s", task_id)
+                                    tool_result = {"error": f"cluster_places failed: {exc}"}
+                            else:
+                                tool_result = {"error": f"Unknown tool: {tc.function.name}"}
                         messages.append(
                             {
                                 "role": "tool",
@@ -151,6 +174,7 @@ class ClusteringWorker(Worker[None]):
             await self.storage.update_task(task_id, state="failed")
 
         except Exception:
+            logger.exception("Clustering worker crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
 

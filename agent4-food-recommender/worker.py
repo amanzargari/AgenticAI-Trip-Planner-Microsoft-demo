@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import json
-import re
-import uuid
+import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from fasta2a.schema import Artifact, Message, TaskIdParams, TaskSendParams
 from fasta2a.worker import Worker
+from pydantic import BaseModel
 
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
+from shared.models import RestaurantCandidate
 from tools import TOOLS, search_restaurants
+
+logger = logging.getLogger(__name__)
+
+
+# ── Structured output model ───────────────────────────────────────────────────
+
+class FoodOutput(BaseModel):
+    restaurants: list[RestaurantCandidate]
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
 You are the Food Recommender Agent.
@@ -32,23 +44,7 @@ Tool strategy:
 3) Deduplicate overlapping results; keep the best options by rating.
 4) If a tool call fails, continue with remaining searches.
 
-Output rules (STRICT):
-- Return ONLY JSON (no markdown, no prose).
-- Return exactly:
-{
-    "restaurants": [
-        {
-            "id": "...",
-            "name": "...",
-            "location": {"latitude": 0.0, "longitude": 0.0, "address": "..."},
-            "price_level": 2,
-            "cuisines": ["Italian"],
-            "rating": 4.4,
-            "summary": "..."
-        }
-    ]
-}
-- Return up to 5 items; if none are available return {"restaurants": []}.
+Return up to 5 restaurants. If none available, return an empty list.
 """
 
 
@@ -89,70 +85,69 @@ class FoodRecommenderWorker(Worker[None]):
                 {"role": "user", "content": json.dumps(data)},
             ]
 
+            # Phase 1: tool calls — no response_format (Gemini rejects tool_choice=required + response_format together)
+            tool_called = False
             for _ in range(8):
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice="auto" if tool_called else "required",
                 )
                 choice = response.choices[0]
 
                 if choice.finish_reason == "tool_calls":
+                    tool_called = True
                     tool_calls = choice.message.tool_calls or []
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": choice.message.content,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments,
-                                    },
-                                }
-                                for tc in tool_calls
-                            ],
-                        }
-                    )
-                    for tc in tool_calls:
-                        args = json.loads(tc.function.arguments)
-                        if tc.function.name == "search_restaurants":
-                            tool_result = await search_restaurants(**args)
-                        else:
-                            tool_result = {"error": f"Unknown tool: {tc.function.name}"}
-                        messages.append(
+                    messages.append({
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": [
                             {
-                                "role": "tool",
-                                "content": json.dumps(tool_result),
-                                "tool_call_id": tc.id,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                             }
-                        )
+                            for tc in tool_calls
+                        ],
+                    })
+                    for tc in tool_calls:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            tool_result: Any = {"error": str(exc)}
+                        else:
+                            try:
+                                if tc.function.name == "search_restaurants":
+                                    tool_result = await search_restaurants(**args)
+                                else:
+                                    tool_result = {"error": f"Unknown tool: {tc.function.name}"}
+                            except Exception as exc:
+                                tool_result = {"error": str(exc), "restaurants": []}
+                        messages.append({
+                            "role": "tool",
+                            "content": json.dumps(tool_result),
+                            "tool_call_id": tc.id,
+                        })
                 else:
-                    raw = choice.message.content or "{}"
-                    result = _parse_json(raw)
-                    await self.storage.update_task(
-                        task_id,
-                        state="completed",
-                        new_artifacts=self.build_artifacts(result),
-                    )
-                    return
+                    break
 
-            await self.storage.update_task(task_id, state="failed")
+            # Phase 2: structured output — no tools so response_format works without conflict
+            try:
+                final = await llm.beta.chat.completions.parse(
+                    model=DEFAULT_MODEL,
+                    messages=messages,
+                    response_format=FoodOutput,
+                )
+                parsed: Optional[FoodOutput] = final.choices[0].message.parsed
+                result = parsed.model_dump(mode="json") if parsed else {"restaurants": []}
+            except Exception:
+                logger.warning("FoodRecommender phase-2 parse failed task_id=%s", task_id)
+                result = {"restaurants": []}
+            await self.storage.update_task(task_id, state="completed",
+                                           new_artifacts=self.build_artifacts(result))
 
         except Exception:
+            logger.exception("FoodRecommender task crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
-
-
-def _parse_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        text = match.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"restaurants": []}

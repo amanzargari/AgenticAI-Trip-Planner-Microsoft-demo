@@ -321,22 +321,22 @@ pre.trace-json {
             <h3>Plan a new trip</h3>
 
             <label for="city">Destination</label>
-            <input id="city" type="text" placeholder="Paris, Rome, Tokyo…" value="Paris"/>
+            <input id="city" type="text" placeholder="Paris, Rome, Tokyo…" value="Milan, Italy"/>
 
             <label>Dates</label>
             <div class="date-row">
               <input id="trip_start" type="date" value="2026-06-10"/>
-              <input id="trip_end"   type="date" value="2026-06-13"/>
+              <input id="trip_end"   type="date" value="2026-06-15"/>
             </div>
 
             <label for="budget">Budget (EUR, optional)</label>
-            <input id="budget" type="number" min="0" placeholder="e.g. 500"/>
+            <input id="budget" type="number" min="0" placeholder="e.g. 500" value="800"/>
 
             <label for="reason">Trip reason (optional)</label>
-            <input id="reason" type="text" placeholder="honeymoon, family vacation…"/>
+            <input id="reason" type="text" placeholder="honeymoon, family vacation…" value="vacation with friends"/>
 
             <label for="preferences">Preferences (optional)</label>
-            <input id="preferences" type="text" placeholder="museums, vegetarian, outdoor walks…"/>
+            <input id="preferences" type="text" placeholder="museums, vegetarian, outdoor walks…" value="ok with everything and also night life is important for me, we are adults and we don't have kids, we love museums"/>
             <div class="prefs-hint">Write anything — interests, dietary needs, travel style.</div>
 
             <button class="plan-btn" id="plan-btn" onclick="submitPlan()">Generate Itinerary →</button>

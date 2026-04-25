@@ -87,17 +87,19 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "order_places_by_proximity",
+            "strict": True,
             "description": (
                 "Reorder a list of places using nearest-neighbour to minimise "
                 "total walking distance. Call this first to get an efficient visit order."
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "places": {
                         "type": "array",
                         "description": "List of place objects with location.latitude and location.longitude.",
-                        "items": {"type": "object"},
+                        "items": {},
                     }
                 },
                 "required": ["places"],
@@ -108,9 +110,11 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "estimate_travel_minutes",
+            "strict": True,
             "description": "Estimate walking travel time in minutes between two lat/lng points.",
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "from_lat": {"type": "number"},
                     "from_lng": {"type": "number"},
@@ -125,12 +129,14 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "recommend_restaurant",
+            "strict": True,
             "description": (
                 "Ask the Food Recommender agent for restaurant suggestions near a location. "
                 "Call once for lunch and once for dinner."
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "time_of_day": {
                         "type": "string",
@@ -138,6 +144,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "search_center": {
                         "type": "object",
+                        "additionalProperties": False,
                         "description": "Center of search area {latitude, longitude}.",
                         "properties": {
                             "latitude": {"type": "number"},
@@ -146,21 +153,22 @@ TOOLS: list[dict[str, Any]] = [
                         "required": ["latitude", "longitude"],
                     },
                     "search_radius_meters": {
-                        "type": "integer",
-                        "description": "Search radius in metres.",
-                        "default": 500,
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                        "description": "Search radius in metres (default 500).",
                     },
                     "budget_per_meal_per_person": {
-                        "type": "number",
+                        "anyOf": [{"type": "number"}, {"type": "null"}],
                         "description": "Budget per meal per person in EUR (null = no limit).",
                     },
                     "preferences": {
-                        "type": "array",
-                        "items": {"type": "string"},
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "null"},
+                        ],
                         "description": "Dietary or cuisine preferences.",
                     },
                 },
-                "required": ["time_of_day", "search_center"],
+                "required": ["time_of_day", "search_center", "search_radius_meters", "budget_per_meal_per_person", "preferences"],
             },
         },
     },

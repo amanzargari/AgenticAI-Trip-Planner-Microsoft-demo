@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any, Optional, Union
 
 from fasta2a.schema import Artifact, Message, TaskIdParams, TaskSendParams
 from fasta2a.worker import Worker
+from pydantic import BaseModel, Field
 
 from shared.a2a_utils import extract_message_data, make_data_artifact
 from shared.llm import DEFAULT_MODEL, get_llm_client
+from shared.models import MealEvent, VisitEvent
 from tools import (
     TOOLS,
     estimate_travel_minutes,
@@ -19,6 +20,20 @@ from tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ── Structured output model ───────────────────────────────────────────────────
+
+# Discriminated union so the LLM knows which event shape to produce
+ScheduleEvent = Annotated[Union[VisitEvent, MealEvent], Field(discriminator="type")]
+
+
+class SchedulerOutput(BaseModel):
+    date: str                        # YYYY-MM-DD
+    events: list[ScheduleEvent]
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
 You are the Daily Scheduler Agent.
@@ -42,29 +57,8 @@ Scheduling policy:
 7) If no places can fit, return an empty events list.
 
 Important:
-- If a tool call returns {"error": ...}, ignore it gracefully and continue scheduling.
-- Do NOT retry a tool that already returned an error. Move on.
-
-Output rules (STRICT):
-- Return ONLY JSON (no markdown, no prose, no backticks).
-- Return exactly:
-{
-    "date": "YYYY-MM-DD",
-    "events": [
-        {
-            "type": "visit",
-            "start_time": "ISO datetime",
-            "end_time": "ISO datetime",
-            "place": { ... }
-        },
-        {
-            "type": "meal",
-            "time": "ISO datetime",
-            "restaurant": { ... },
-            "meal_slot": "lunch"
-        }
-    ]
-}
+- If a tool call returns {"error": ...}, ignore it gracefully and continue.
+- Do NOT retry a tool that already returned an error.
 """
 
 
@@ -100,41 +94,39 @@ class SchedulerWorker(Worker[None]):
             data = extract_message_data(params["message"])
             llm = get_llm_client()
 
-            day_date = _extract_date(data.get("day_start", ""))
+            day_date = str(data.get("day_start", ""))[:10]
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(data)},
             ]
 
+            # Phase 1: tool calls — no response_format (Gemini rejects tool_choice=required + response_format together)
+            tool_called = False
             for step in range(20):
                 response = await llm.chat.completions.create(
                     model=DEFAULT_MODEL,
                     messages=messages,
                     tools=TOOLS,
-                    tool_choice="auto",
+                    tool_choice="auto" if tool_called else "required",
                 )
                 choice = response.choices[0]
 
                 if choice.finish_reason == "tool_calls":
+                    tool_called = True
                     tool_calls = choice.message.tool_calls or []
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": choice.message.content,
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments,
-                                    },
-                                }
-                                for tc in tool_calls
-                            ],
-                        }
-                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                            }
+                            for tc in tool_calls
+                        ],
+                    })
                     for tc in tool_calls:
                         name = tc.function.name
                         try:
@@ -158,10 +150,7 @@ class SchedulerWorker(Worker[None]):
                             else:
                                 tool_result = {"error": f"Unknown tool: {name}"}
                         except Exception as exc:
-                            logger.warning(
-                                "Scheduler tool %s failed task_id=%s: %s", name, task_id, exc
-                            )
-                            # Return an error message so the LLM can gracefully skip this meal
+                            logger.warning("Scheduler tool %s failed task_id=%s: %s", name, task_id, exc)
                             tool_result = {"error": f"{name} failed: {exc}", "restaurants": []}
 
                         messages.append({
@@ -170,51 +159,27 @@ class SchedulerWorker(Worker[None]):
                             "tool_call_id": tc.id,
                         })
                 else:
-                    raw = choice.message.content or "{}"
-                    result = _parse_json(raw)
-                    if not result.get("date") and day_date:
-                        result["date"] = day_date
-                    await self.storage.update_task(
-                        task_id,
-                        state="completed",
-                        new_artifacts=self.build_artifacts(result),
-                    )
-                    return
+                    break
 
-            # Exhausted iterations — complete with empty schedule rather than fail
-            logger.warning("Scheduler exhausted iterations task_id=%s, returning empty day", task_id)
+            # Phase 2: structured output — no tools so response_format works without conflict
+            try:
+                final = await llm.beta.chat.completions.parse(
+                    model=DEFAULT_MODEL,
+                    messages=messages,
+                    response_format=SchedulerOutput,
+                )
+                parsed: Optional[SchedulerOutput] = final.choices[0].message.parsed
+                result = parsed.model_dump(mode="json") if parsed else {"date": day_date, "events": []}
+            except Exception:
+                logger.warning("Scheduler phase-2 parse failed task_id=%s", task_id)
+                result = {"date": day_date, "events": []}
             await self.storage.update_task(
                 task_id,
                 state="completed",
-                new_artifacts=self.build_artifacts({"date": day_date, "events": []}),
+                new_artifacts=self.build_artifacts(result),
             )
 
         except Exception:
             logger.exception("Scheduler task crashed task_id=%s", task_id)
             await self.storage.update_task(task_id, state="failed")
             raise
-
-
-def _parse_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        text = match.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    brace = text.find("{")
-    if brace > 0:
-        try:
-            return json.loads(text[brace:])
-        except json.JSONDecodeError:
-            pass
-    return {"date": "", "events": []}
-
-
-def _extract_date(iso: str) -> str:
-    """Extract YYYY-MM-DD from an ISO datetime string."""
-    if iso and len(iso) >= 10:
-        return iso[:10]
-    return ""

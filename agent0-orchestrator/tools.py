@@ -80,6 +80,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "recommend_places",
+            "strict": True,
             "description": (
                 "Ask the Place Recommender agent (Agent 1) for a list of tourist "
                 "attractions and points of interest for the trip city. "
@@ -87,6 +88,7 @@ TOOLS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "city": {
                         "type": "string",
@@ -101,20 +103,22 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "Trip end as ISO datetime string.",
                     },
                     "activity_budget": {
-                        "type": "number",
+                        "anyOf": [{"type": "number"}, {"type": "null"}],
                         "description": "Activity budget in EUR (70% of total). Null if unset.",
                     },
                     "trip_reason": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "Reason for the trip, e.g. 'family vacation'.",
                     },
                     "preferences": {
-                        "type": "array",
-                        "items": {"type": "string"},
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "null"},
+                        ],
                         "description": "User preference tags, e.g. ['art', 'outdoor'].",
                     },
                 },
-                "required": ["city", "trip_start", "trip_end"],
+                "required": ["city", "trip_start", "trip_end", "activity_budget", "trip_reason", "preferences"],
             },
         },
     },
@@ -122,6 +126,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "cluster_places",
+            "strict": True,
             "description": (
                 "Ask the Clustering agent (Agent 2) to group place_candidates "
                 "into one geographic cluster per trip day. "
@@ -129,6 +134,7 @@ TOOLS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "trip_start": {
                         "type": "string",
@@ -140,7 +146,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "place_candidates": {
                         "type": "array",
-                        "items": {"type": "object"},
+                        "items": {},
                         "description": "Full list of place objects returned by recommend_places.",
                     },
                 },
@@ -152,6 +158,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "schedule_day",
+            "strict": True,
             "description": (
                 "Ask the Daily Scheduler agent (Agent 3) to build a chronological "
                 "schedule for one day from a cluster of places. "
@@ -159,10 +166,11 @@ TOOLS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "places": {
                         "type": "array",
-                        "items": {"type": "object"},
+                        "items": {},
                         "description": "Places for this specific day (one cluster).",
                     },
                     "day_start": {
@@ -174,16 +182,18 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "End of the day as ISO datetime (e.g. '2026-06-10T21:00:00').",
                     },
                     "food_budget_per_day": {
-                        "type": "number",
+                        "anyOf": [{"type": "number"}, {"type": "null"}],
                         "description": "Food budget in EUR for this day. Null if unset.",
                     },
                     "preferences": {
-                        "type": "array",
-                        "items": {"type": "string"},
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "null"},
+                        ],
                         "description": "User dietary/cuisine preferences.",
                     },
                 },
-                "required": ["places", "day_start", "day_end"],
+                "required": ["places", "day_start", "day_end", "food_budget_per_day", "preferences"],
             },
         },
     },
