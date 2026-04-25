@@ -170,8 +170,27 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "places": {
                         "type": "array",
-                        "items": {},
-                        "description": "Places for this specific day (one cluster).",
+                        "description": "Full place objects from cluster_places output. Pass them as-is — do NOT replace with IDs or strings.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id":   {"type": "string"},
+                                "name": {"type": "string"},
+                                "location": {
+                                    "type": "object",
+                                    "properties": {
+                                        "latitude":  {"type": "number"},
+                                        "longitude": {"type": "number"},
+                                        "address":   {"type": "string"},
+                                    },
+                                    "required": ["latitude", "longitude"],
+                                },
+                                "estimated_visit_duration_minutes": {"type": "integer"},
+                                "category": {"type": "string"},
+                                "rating":   {"type": "number"},
+                            },
+                            "required": ["id", "name", "location"],
+                        },
                     },
                     "day_start": {
                         "type": "string",

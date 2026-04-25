@@ -49,6 +49,8 @@ Available tools:
 3) schedule_day(places, day_start, day_end, food_budget_per_day, preferences)
      → {"date": "YYYY-MM-DD", "events": [...]}
 
+IMPORTANT: when calling schedule_day, pass each cluster's place objects from cluster_places output VERBATIM (with id, name, location, etc.). Never pass only IDs or strings — agent3 will return empty events.
+
 Execution rules:
 - Always call recommend_places before cluster_places; cluster_places before schedule_day.
 - day_start = 09:00 on each date; day_end = 21:00 on each date.

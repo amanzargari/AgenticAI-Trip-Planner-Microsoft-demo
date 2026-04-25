@@ -15,6 +15,7 @@ from shared.models import MealEvent, VisitEvent
 from tools import (
     TOOLS,
     estimate_travel_minutes,
+    hydrate_places, 
     order_places_by_proximity,
     recommend_restaurant,
 )
@@ -95,6 +96,13 @@ class SchedulerWorker(Worker[None]):
             llm = get_llm_client()
 
             day_date = str(data.get("day_start", ""))[:10]
+
+            # Resolve Place IDs → full place objects so the LLM and tools
+            # always see a uniform shape, regardless of what the orchestrator sent.
+            hydrated = await hydrate_places(data.get("places"))
+            if not hydrated:
+                logger.warning("Scheduler: no schedulable places after hydration task_id=%s", task_id)
+            data["places"] = hydrated
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": SYSTEM_PROMPT},

@@ -9,6 +9,8 @@ import json
 import math
 import os
 from typing import Any
+import asyncio
+import httpx
 
 from shared.a2a_utils import call_agent
 
@@ -142,6 +144,113 @@ async def recommend_restaurant(
     result = await call_agent(AGENT4_URL, payload)
     return result.get("restaurants", [])
 
+_PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+
+
+def _category_from_types(types: list[str]) -> str:
+    priority = [
+        "museum", "art_gallery", "tourist_attraction", "park", "zoo",
+        "amusement_park", "aquarium", "church", "mosque", "synagogue",
+        "stadium", "shopping_mall", "spa", "night_club", "library",
+        "natural_feature", "landmark",
+    ]
+    for t in priority:
+        if t in types:
+            return t.replace("_", " ")
+    return types[0].replace("_", " ") if types else "attraction"
+
+
+def _duration_from_types(types: list[str]) -> int:
+    long_visits = {"museum", "art_gallery", "zoo", "amusement_park", "aquarium"}
+    short_visits = {"church", "mosque", "synagogue", "natural_feature", "landmark"}
+    for t in types:
+        if t in long_visits:
+            return 120
+        if t in short_visits:
+            return 45
+    return 60
+
+
+async def _fetch_place_details(place_id: str, client: httpx.AsyncClient) -> dict[str, Any] | None:
+    """Resolve a Google Place ID to a full place object. Returns None on any failure."""
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return None
+    params = {
+        "place_id": place_id,
+        "fields": "place_id,name,geometry/location,formatted_address,types,rating",
+        "key": api_key,
+    }
+    try:
+        resp = await client.get(_PLACE_DETAILS_URL, params=params, timeout=15.0)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception:
+        return None
+
+    if str(raw.get("status") or "") != "OK":
+        return None
+
+    result = raw.get("result") or {}
+    loc = (result.get("geometry") or {}).get("location") or {}
+    if "lat" not in loc or "lng" not in loc:
+        return None
+
+    types = result.get("types") or []
+    return {
+        "id": result.get("place_id") or place_id,
+        "name": result.get("name") or "",
+        "location": {
+            "latitude": loc["lat"],
+            "longitude": loc["lng"],
+            "address": result.get("formatted_address") or "",
+        },
+        "estimated_visit_duration_minutes": _duration_from_types(types),
+        "category": _category_from_types(types),
+        "rating": result.get("rating"),
+    }
+
+
+async def hydrate_places(raw: Any) -> list[dict[str, Any]]:
+    """Turn a mixed list of Place IDs (strings) and/or place dicts into full place objects.
+
+    - dicts: passed through _coerce_places (existing validation preserved).
+    - strings: treated as Google Place IDs and resolved via the Places Details API.
+    - stringified JSON objects: parsed and treated as dicts.
+    """
+    if isinstance(raw, dict):
+        for key in ("places", "place_candidates", "clustered_place_candidates"):
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        return []
+
+    ids: list[str] = []
+    dicts: list[Any] = []
+    for item in raw:
+        if isinstance(item, dict):
+            dicts.append(item)
+        elif isinstance(item, str):
+            try:
+                parsed = json.loads(item)
+                if isinstance(parsed, dict):
+                    dicts.append(parsed)
+                    continue
+            except json.JSONDecodeError:
+                pass
+            ids.append(item)
+
+    coerced = _coerce_places(dicts)
+
+    if ids:
+        async with httpx.AsyncClient() as client:
+            hydrated = await asyncio.gather(
+                *(_fetch_place_details(pid, client) for pid in ids)
+            )
+        coerced.extend(p for p in hydrated if p is not None)
+
+    return coerced
 
 # ── LLM tool schemas ──────────────────────────────────────────────────────────
 
@@ -236,3 +345,5 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
